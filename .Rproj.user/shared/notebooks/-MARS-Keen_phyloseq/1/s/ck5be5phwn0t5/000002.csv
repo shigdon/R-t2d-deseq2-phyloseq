@@ -1,0 +1,2 @@
+"0","bp_alpha_saliva <- subset_samples(bp_alpha_pruned, Sample_Type == ""Saliva"")"
+"0","bp_alpha_fecal <- subset_samples(bp_alpha_pruned, Sample_Type == ""Fecal"")"

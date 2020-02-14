@@ -1,0 +1,2 @@
+"0","# save plot"
+"0","ggsave(""./deseq2_output/plots/fecal_bp_diff_abund_BC.pdf"", bp_diff_abund_fecal_BC_plot, width = 22, height = 12)"

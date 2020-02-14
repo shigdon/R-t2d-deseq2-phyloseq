@@ -1,0 +1,7 @@
+"0","pal = ""Dark2"""
+"0","scale_colour_discrete <-  function(palname=pal, ...){"
+"0","  scale_colour_brewer(palette=palname, ...)"
+"0","}"
+"0","scale_fill_discrete <-  function(palname=pal, ...){"
+"0","  scale_fill_brewer(palette=palname, ...)"
+"0","}"

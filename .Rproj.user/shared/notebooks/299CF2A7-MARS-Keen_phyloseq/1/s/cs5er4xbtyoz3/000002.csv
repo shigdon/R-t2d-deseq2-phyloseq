@@ -1,0 +1,56 @@
+"0","# Summarize bracken_physeq"
+"0","bp_norm_saliva_B"
+"1","phyloseq-class experiment-level object"
+"1","
+"
+"1","otu_table()   OTU Table:         [ 401 taxa and 20 samples ]"
+"1","
+"
+"1","sample_data() Sample Data:       [ 20 samples by 6 sample variables ]"
+"1","
+"
+"1","tax_table()   Taxonomy Table:    [ 401 taxa by 9 taxonomic ranks ]"
+"1","
+"
+"0","# Check Sample_Type Factor"
+"0","head(sample_data(bp_norm_saliva_B)$Timepoint, n=2)"
+"1","[1]"
+"1"," Initial"
+"1"," Final  "
+"1","
+"
+"1","Levels: "
+"1","Final Initial"
+"1","
+"
+"0","# Convert Phyloseq Object to DESeq2 Class Object by Factor Timepoint"
+"0","bp_saliva_B_dds <- phyloseq_to_deseq2(bp_norm_saliva_B, ~Timepoint)"
+"2","converting counts to integer mode
+"
+"0","# calculate geometric means prior to estimate size factors"
+"0","gm_mean = function(x, na.rm=TRUE){"
+"0","  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))"
+"0","}"
+"0","bp_saliva_B_geoMeans = apply(counts(bp_saliva_B_dds), 1, gm_mean)"
+"0","bp_saliva_B_dds = estimateSizeFactors(bp_saliva_B_dds, geoMeans=bp_saliva_B_geoMeans)"
+"0","bp_saliva_B_dds = DESeq(bp_saliva_B_dds, test = ""Wald"", fitType=""local"")"
+"2","using pre-existing size factors
+"
+"2","estimating dispersions
+"
+"2","gene-wise dispersion estimates
+"
+"2","mean-dispersion relationship
+"
+"2","final dispersion estimates
+"
+"2","fitting model and testing
+"
+"2","-- replacing outliers and refitting for 50 genes
+-- DESeq argument 'minReplicatesForReplace' = 7 
+-- original counts are preserved in counts(dds)
+"
+"2","estimating dispersions
+"
+"2","fitting model and testing
+"

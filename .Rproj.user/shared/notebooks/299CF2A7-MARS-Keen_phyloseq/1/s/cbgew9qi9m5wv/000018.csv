@@ -1,0 +1,2 @@
+"0","# save plot"
+"0","ggsave(""./deseq2_output/plots/saliva_bp_diff_abund_AD.pdf"", bp_diff_abund_saliva_AD_plot, width = 22, height = 12)"

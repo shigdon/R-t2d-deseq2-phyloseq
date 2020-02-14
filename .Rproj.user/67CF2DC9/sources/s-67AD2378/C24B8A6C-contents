@@ -1,0 +1,2985 @@
+---
+title: "MARS-Keen_phyloseq"
+author: "Shawn Higdon"
+date: "6/24/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+```{r Libraries, message=FALSE}
+library(rhdf5)
+library(ggplot2)
+library(ggrepel)
+library(tidyverse)
+library(phyloseq)
+library(biomformat)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(viridis)
+library(circlize)
+library(DESeq2)
+theme_set(theme_bw())
+```
+
+
+## Data Import
+### Kraken-Biom
+### Sample Map
+
+Kraken Reports were used as input for Bayesian Re-estimation of Taxa Abundance using [**Bracken v2**](https://github.com/jenniferlu717/Bracken). Bracken Report files were converted to biom hdf5 format using the python package [**kraken-biom**](https://github.com/smdabdoub/kraken-biom).
+
+
+> Use `biomformat` to read in bracken-biom file in hdf5 format
+
+```{r}
+# read in hdf5 biom table from kraken-biom output of bracken reports
+bracken_biom_file <- read_hdf5_biom("./MARS-Keen_bracken_biom_table.hdf5")
+
+# create biom object
+bracken_biom <- biom(bracken_biom_file)
+bracken_physeq <- import_biom(bracken_biom, parseFunction = parse_taxonomy_greengenes)
+
+# summary of bracken biom
+bracken_physeq
+head(tax_table(bracken_physeq))
+
+# Read in the sample map file (list has strictly static order, numeric ascending)
+sample_map <- read.csv("./../meta_files/MARS-Keen_metadata.csv", header = T, row.names = 1)
+
+# create phyloseq sample map from dataframe
+bracken_sam <- sample_data(sample_map, errorIfNULL = TRUE)
+
+bracken_physeq <- merge_phyloseq(bracken_physeq, bracken_sam)
+
+# add tax rank Species2
+tax_table(bracken_physeq) <- cbind(tax_table(bracken_physeq), OTU=taxa_names(bracken_physeq))
+
+## Define Ranks to include
+label_ranks <- c("Genus", "Species", "OTU")
+labels <- apply(tax_table(bracken_physeq)[, label_ranks], 1, paste, sep="", collapse=" ")
+## add concatenated labels as a new rank after Species2
+tax_table(bracken_physeq) <- cbind(tax_table(bracken_physeq), Species2=labels)
+head(tax_table(bracken_physeq))
+
+
+ntaxa(bracken_physeq)
+nsamples(bracken_physeq)
+sample_names(bracken_physeq)
+rank_names(bracken_physeq)
+sample_variables(bracken_physeq)
+```
+
+### Processed Data Analysis
+
+#### Normalization
+
+> The data must be normalized to account for variation among samples in sequencing depth. This is achieved by converting abundances to counts per million.
+
+##### Counts per Million (CPM)
+
+> Using the Phyloseq suggested method of normalization
+
+```{r Preprocessing bp transform}
+
+# transform to even sampling depth with Phyloseq CPM method
+bp_norm <- transform_sample_counts(bracken_physeq, function(x) 1E6 * x/sum(x))
+bp_norm_beta <- prune_taxa(taxa_sums(bp_norm) > 100, bp_norm)
+bp_norm_beta
+```
+
+##### BCW Normalization method
+
+> Calculating relative abundance, followed by division by total reads to account for difference in read population size (sampling depth) and multiplying by a scaling factor
+
+```{r}
+# normalize the count data
+bp_norm_bcw <- transform_sample_counts(bracken_physeq, function(x) (x/sum(x))/sum(x) * 1E6)
+
+# create matrices for otu table and taxonomy table
+bp_norm_bcw_otu_table <- as(otu_table(bp_norm_bcw), "matrix")
+bp_norm_bcw_taxa_table <- as(tax_table(bp_norm_bcw), "matrix")
+
+# convert matrices to data.frame
+bp_norm_bcw_otu_table_df <- as.data.frame(bp_norm_bcw_otu_table)
+bp_norm_bcw_taxa_table_df <- as.data.frame(bp_norm_bcw_taxa_table)
+
+# inspect elements
+#head(bp_norm_bcw_otu_table_df)
+#head(bp_norm_bcw_taxa_table_df)
+
+# mutate otu table to add Taxonomy ID variable
+bp_norm_bcw_otu_table_df <- mutate(bp_norm_bcw_otu_table_df, OTU= rownames(bp_norm_bcw_otu_table_df))
+
+# Merge OTU and Taxonomy dataframes by OTU variable
+bp_bcw_norm_master_df <- inner_join(bp_norm_bcw_otu_table_df,
+                                    bp_norm_bcw_taxa_table_df,
+                                    by = "OTU")
+# Inspect non sample variable names
+colnames(bp_bcw_norm_master_df[153:161])
+
+# clone for rownames as taxa names
+bp_bcw_norm_master_df2 <- bp_bcw_norm_master_df
+
+# set rownames to full taxonomic id (genus + species + OTU tax_id)
+rownames(bp_bcw_norm_master_df2) <- bp_bcw_norm_master_df$Species2
+
+# subset dataframe to grab only sample abundance data
+bp_bcw_norm_abund_df <- bp_bcw_norm_master_df2[,1:152]
+
+# save normalized OTU abundance matrix
+write.csv(bp_bcw_norm_abund_df, "./R_output_files/bracken_bcw-normalized-relabund_tax-names.csv")
+```
+
+### Diff. Time Abund Matrix 
+
+> Using relative abundance values per taxon normalized for seq. depth:
+
+* Subset data by Timepoint
+* Compute differences in abundance
+* Arrange in Matrix of differential abundance values by sampling timepoint(rows as taxa, columns as sample)
+
+```{r}
+# Convert master df to narrow format, Keep Taxon Name
+bp_bcw_norm_abund_narrow_df <- bp_bcw_norm_master_df %>% gather(key = "Sample", value = "norm_rel_abund", -Species2)
+
+# Inspect Element
+head(bp_bcw_norm_abund_narrow_df)
+
+# add time variable to bp_bcw_norm_master_df
+bp_bcw_norm_abund_narrow_df$Timepoint <- sample_map$Timepoint[match(bp_bcw_norm_abund_narrow_df$Sample, rownames(sample_map))]
+
+# add Patient_ID Variable
+bp_bcw_norm_abund_narrow_df$Patient_ID <- sample_map$Sample_ID[match(bp_bcw_norm_abund_narrow_df$Sample, rownames(sample_map))]
+
+# add Sample_Type Variable
+bp_bcw_norm_abund_narrow_df$Sample_Type <- sample_map$Sample_Type[match(bp_bcw_norm_abund_narrow_df$Sample, rownames(sample_map))]
+
+# subset by Sample_Type to create two dataframes
+## Saliva
+bp_bcw_norm_abund_narrow_saliva_df <- filter(bp_bcw_norm_abund_narrow_df, Sample_Type == "Saliva")
+
+## Fecal
+bp_bcw_norm_abund_narrow_fecal_df <- filter(bp_bcw_norm_abund_narrow_df, Sample_Type == "Fecal")
+
+# Check that the levels of patient ID are equal between sample types
+unique(bp_bcw_norm_abund_narrow_saliva_df$Patient_ID)
+nlevels(bp_bcw_norm_abund_narrow_fecal_df$Patient_ID)
+
+# Subset based on Timepoint
+## Saliva
+### Time 1 (t1)
+bp_bcw_norm_abund_sal_t1 <- bp_bcw_norm_abund_narrow_saliva_df %>% filter(Timepoint == "Initial") %>% select("Species2", "norm_rel_abund", "Patient_ID")
+
+### Time 2 (t2)
+bp_bcw_norm_abund_sal_t2 <- bp_bcw_norm_abund_narrow_saliva_df %>% filter(Timepoint == "Final")
+colnames(bp_bcw_norm_abund_sal_t1)
+head(bp_bcw_norm_abund_sal_t1)
+### Spread
+bp_bcw_norm_abund_sal_t1_wide <- dcast(bp_bcw_norm_abund_sal_t1, Species2 ~ Patient_ID, value.var="norm_rel_abund")
+?dcast()
+head(bp_bcw_norm_abund_sal_t1_wide)
+## Fecal
+
+unique(bp_bcw_norm_abund_narrow_fecal_df$Patient_ID)
+unique(bp_bcw_norm_abund_narrow_saliva_df$Patient_ID)
+
+
+
+# Compute difference between matrices
+head(bp_bcw_norm_abund_narrow_saliva_df)
+
+```
+
+
+## Phyloseq Plots
+
+### Alpha Diversity: Sample Richness
+
+```{r ggplot2 color theming}
+pal = "Dark2"
+scale_colour_discrete <-  function(palname=pal, ...){
+  scale_colour_brewer(palette=palname, ...)
+}
+scale_fill_discrete <-  function(palname=pal, ...){
+  scale_fill_brewer(palette=palname, ...)
+}
+```
+
+#### Prune Taxa
+
+> Remove taxa for alpha diversity plots that are not in any samples
+
+```{r}
+bp_alpha_pruned <- prune_taxa(taxa_sums(bracken_physeq) > 0, bracken_physeq)
+```
+
+#### Subset by Sample Type
+
+```{r}
+bp_alpha_saliva <- subset_samples(bp_alpha_pruned, Sample_Type == "Saliva")
+bp_alpha_fecal <- subset_samples(bp_alpha_pruned, Sample_Type == "Fecal")
+```
+
+#### Subset by Time
+```{r}
+bp_alpha_saliva_initial <- subset_samples(bp_alpha_saliva, Timepoint == "Initial")
+bp_alpha_saliva_final <- subset_samples(bp_alpha_saliva, Timepoint == "Final")
+
+bp_alpha_fecal_initial <- subset_samples(bp_alpha_fecal, Timepoint == "Initial")
+bp_alpha_fecal_final <- subset_samples(bp_alpha_fecal, Timepoint == "Final")
+```
+
+#### Plot Richness
+
+### Overall by Sample Type
+```{r}
+# Shannon Diversity Index by sample_type
+bp_alpha_plot_type <- plot_richness(bracken_physeq, x = "Sample_Type", color = "Sample_Type", measures = c("Observed", "Chao1", "Shannon"), title = "Microbiome Sample Alpha Diversity: Sample Type")
+bp_alpha_plot_type <- bp_alpha_plot_type + labs(color="Sample_Type") +
+  xlab("Sample Type") +
+  labs(color = "Sample Type") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 10))
+
+bp_alpha_plot_type
+```
+
+##### Box Plot: Sample Type
+```{r}
+bp_alpha_boxplot_type <- plot_richness(bracken_physeq, x = "Sample_Type", color = "Sample_Type", measures = c("Observed", "Chao1", "Shannon"), title = "Microbiome Alpha Diversity: All Samples by Type")
+bp_alpha_boxplot_type <- bp_alpha_boxplot_type + geom_boxplot() +
+  labs(color="Sample Type") +
+  xlab("Sample Type") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 10))
+
+bp_alpha_boxplot_type
+```
+
+##### Merged Plot: By Sample Type
+
+> All samples were merged based on Sample Type of either Fecal or Saliva
+
+```{r}
+# merge by sample type
+bp_merged_sample_type <- merge_samples(bracken_physeq, "Sample_Type")
+
+# repair variable that was damaged during merge (coerced to numeric)
+sample_data(bp_merged_sample_type)$Sample_Type <- factor(sample_names(bp_merged_sample_type))
+
+# plot merged version of data
+bp_merged_alpha_plot <- plot_richness(bp_merged_sample_type, x = "Sample_Type",
+                                      color = "Sample_Type", measures = c("Observed", "Chao1", "Shannon"), title = "Microbiome Alpha Diversity: Merged by Sample Type")
+bp_merged_alpha_plot <- bp_merged_alpha_plot + geom_point(size=5, alpha=0.7) +
+  labs(color="Sample Type") +
+  xlab("Sample Type") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 10))
+
+bp_merged_alpha_plot
+```
+
+#### Saliva
+
+##### Individual Sample Alpha Index
+```{r}
+# Alpha Diversity Index
+alpha_bp_saliva_all_plot <- plot_richness(bp_alpha_saliva, x = "Product", color = "Product", measures = c("Observed", "Chao1", "Shannon"), title = "Saliva Microbiome Sample Alpha Diversity")
+alpha_bp_saliva_all_plot <- alpha_bp_saliva_all_plot + labs(color="Product") +
+  xlab("Product") +
+  ylab("Diversity Index") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 10))
+
+alpha_bp_saliva_all_plot
+
+# save plot
+ggsave("./alpha_plots/saliva_bp_alpha_all.pdf", alpha_bp_saliva_all_plot, width = 22, height = 12)
+```
+
+#### Merged Plot: By Product Type
+
+> All samples were merged based on Product Type: A, B, C, D
+
+```{r}
+# merge by sample type
+alpha_bp_saliva_merged_product_type <- merge_samples(bp_alpha_saliva, "Product")
+
+# repair variable that was damaged during merge (coerced to numeric)
+sample_data(alpha_bp_saliva_merged_product_type)$Product <- factor(sample_names(alpha_bp_saliva_merged_product_type))
+
+# plot merged version of data
+alpha_bp_saliva_merged_product_plot <- plot_richness(alpha_bp_saliva_merged_product_type, x = "Product",
+                                      color = "Product", measures = c("Observed", "Chao1", "Shannon"), title = "Saliva Microbiome Alpha Diversity: Merged by Product Treatment")
+alpha_bp_saliva_merged_product_plot <- alpha_bp_saliva_merged_product_plot + geom_point(size=5, alpha=0.7) +
+  labs(color="Product") +
+  xlab("Product") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 10))
+
+alpha_bp_saliva_merged_product_plot
+
+# save plot
+ggsave("./alpha_plots/saliva_bp_alpha_merged_product.pdf", alpha_bp_saliva_merged_product_plot, width = 22, height = 12)
+```
+
+#### Time 1 (Initial)
+```{r}
+# merge by sample type
+alpha_bp_saliva_merged_product_initial <- merge_samples(bp_alpha_saliva_initial, "Product")
+
+# repair variable that was damaged during merge (coerced to numeric)
+sample_data(alpha_bp_saliva_merged_product_initial)$Product <- factor(sample_names(alpha_bp_saliva_merged_product_initial))
+
+# plot merged version of data
+alpha_bp_saliva_merged_initial_plot <- plot_richness(alpha_bp_saliva_merged_product_initial, x = "Product",
+                                      color = "Product", measures = c("Observed", "Chao1", "Shannon"), title = "Saliva Microbiome Alpha Diversity: Merged by Product; Initial Time")
+alpha_bp_saliva_merged_initial_plot <- alpha_bp_saliva_merged_initial_plot + geom_point(size=5, alpha=0.7) +
+  labs(color="Product") +
+  xlab("Product") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 10))
+
+alpha_bp_saliva_merged_initial_plot
+
+# save plot
+ggsave("./alpha_plots/saliva_bp_alpha_merged_initial.pdf", alpha_bp_saliva_merged_initial_plot, width = 22, height = 12)
+```
+
+#### Time 2 (Final)
+```{r}
+# merge by sample type
+alpha_bp_saliva_merged_product_final <- merge_samples(bp_alpha_saliva_final, "Product")
+
+# repair variable that was damaged during merge (coerced to numeric)
+sample_data(alpha_bp_saliva_merged_product_final)$Product <- factor(sample_names(alpha_bp_saliva_merged_product_final))
+
+# plot merged version of data
+alpha_bp_saliva_merged_final_plot <- plot_richness(alpha_bp_saliva_merged_product_final, x = "Product",
+                                      color = "Product", measures = c("Observed", "Chao1", "Shannon"), title = "Saliva Microbiome Alpha Diversity: Merged by Product; Final Time")
+alpha_bp_saliva_merged_final_plot <- alpha_bp_saliva_merged_final_plot + geom_point(size=5, alpha=0.7) +
+  labs(color="Product") +
+  xlab("Product") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 10))
+
+alpha_bp_saliva_merged_final_plot
+
+# save plot
+ggsave("./alpha_plots/saliva_bp_alpha_merged_final.pdf", alpha_bp_saliva_merged_final_plot, width = 22, height = 12)
+```
+
+#### Fecal
+
+#### Time 1 (Initial)
+```{r}
+# merge by sample type
+alpha_bp_fecal_merged_product_initial <- merge_samples(bp_alpha_fecal_initial, "Product")
+
+# repair variable that was damaged during merge (coerced to numeric)
+sample_data(alpha_bp_fecal_merged_product_initial)$Product <- factor(sample_names(alpha_bp_fecal_merged_product_initial))
+
+# plot merged version of data
+alpha_bp_fecal_merged_initial_plot <- plot_richness(alpha_bp_fecal_merged_product_initial, x = "Product",
+                                      color = "Product", measures = c("Observed", "Chao1", "Shannon"), title = "Fecal Microbiome Alpha Diversity: Merged by Product; Initial Time")
+alpha_bp_fecal_merged_initial_plot <- alpha_bp_fecal_merged_initial_plot + geom_point(size=5, alpha=0.7) +
+  labs(color="Product") +
+  xlab("Product") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 10))
+
+alpha_bp_fecal_merged_initial_plot
+
+# save plot
+ggsave("./alpha_plots/fecal_bp_alpha_merged_initial.pdf", alpha_bp_fecal_merged_initial_plot, width = 22, height = 12)
+```
+
+#### Time 2 (Final)
+```{r}
+# merge by sample type
+alpha_bp_fecal_merged_product_final <- merge_samples(bp_alpha_fecal_final, "Product")
+
+# repair variable that was damaged during merge (coerced to numeric)
+sample_data(alpha_bp_fecal_merged_product_final)$Product <- factor(sample_names(alpha_bp_fecal_merged_product_final))
+
+# plot merged version of data
+alpha_bp_fecal_merged_final_plot <- plot_richness(alpha_bp_fecal_merged_product_final, x = "Product",
+                                      color = "Product", measures = c("Observed", "Chao1", "Shannon"), title = "Gut Microbiome Alpha Diversity: Merged by Product; Final Time")
+alpha_bp_fecal_merged_final_plot <- alpha_bp_fecal_merged_final_plot + geom_point(size=5, alpha=0.7) +
+  labs(color="Product") +
+  xlab("Product") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 10))
+
+alpha_bp_fecal_merged_final_plot
+
+# save plot
+ggsave("./alpha_plots/fecal_bp_alpha_merged_final.pdf", alpha_bp_fecal_merged_final_plot, width = 22, height = 12)
+```
+
+
+##### Individual Sample Alpha Index
+```{r}
+# Alpha Diversity Index
+alpha_bp_fecal_all_plot <- plot_richness(bp_alpha_fecal, x = "Product", color = "Product", measures = c("Observed", "Chao1", "Shannon"), title = "Fecal Microbiome Sample Alpha Diversity")
+alpha_bp_fecal_all_plot <- alpha_bp_fecal_all_plot + labs(color="Product") +
+  xlab("Product") +
+  ylab("Diversity Index") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 10))
+
+alpha_bp_fecal_all_plot
+
+# save plot
+ggsave("./alpha_plots/fecal_bp_alpha_all.pdf", alpha_bp_fecal_all_plot, width = 22, height = 12)
+```
+
+#### Merged Plot: By Product Type
+
+> All samples were merged based on Product Type: A, B, C, D
+
+```{r}
+# merge by sample type
+alpha_bp_fecal_merged_product_type <- merge_samples(bp_alpha_fecal, "Product")
+
+# repair variable that was damaged during merge (coerced to numeric)
+sample_data(alpha_bp_fecal_merged_product_type)$Product <- factor(sample_names(alpha_bp_fecal_merged_product_type))
+
+# plot merged version of data
+alpha_bp_fecal_merged_product_plot <- plot_richness(alpha_bp_fecal_merged_product_type, x = "Product",
+                                      color = "Product", measures = c("Observed", "Chao1", "Shannon"), title = "Fecal Microbiome Alpha Diversity: Merged by Product Treatment")
+alpha_bp_fecal_merged_product_plot <- alpha_bp_fecal_merged_product_plot + geom_point(size=5, alpha=0.7) +
+  labs(color="Product") +
+  xlab("Product") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.y = element_text(size = 10))
+
+alpha_bp_fecal_merged_product_plot
+
+# save plot
+ggsave("./alpha_plots/fecal_bp_alpha_merged_product.pdf", alpha_bp_fecal_merged_product_plot, width = 22, height = 12)
+```
+
+
+### Beta Diversity: 
+
+##### Raw Data Analysis
+
+> Beta Diversity analysis with untransformed read data
+
+##### Bray-Curtis Dissimilarity
+```{r Ordination Plots PCoA Bray-Curtis}
+# set orination parameters
+bp_ord1 <- ordinate(bracken_physeq, "PCoA", "bray")
+
+# plot ordination
+bp_bray.curtis_pcoa <- plot_ordination(bracken_physeq, bp_ord1, type="samples", color="Product", shape = "Sample_Type",  title="Microbiome PCoA: Bray-Curtis Dissimilarity")
+
+# aesthetics of ordination plot
+bp_bray.curtis_pcoa <- bp_bray.curtis_pcoa + 
+  labs(color="Product", shape="Sample Type")
+#  geom_text_repel(label = sample_names(bracken_physeq), show.legend = FALSE) +
+#  theme(legend.title = element_text(size = 14),
+#        legend.text = element_text(face = "bold", size = 10),
+#        title = element_text(face = "bold", size = 14),
+#        axis.title.x = element_text(face = "bold", size = 13),
+#        axis.title.y = element_text(face = "bold", size = 13),
+#        axis.text.x = element_text(size = 12),
+#        axis.text.y = element_text(size = 12))
+
+# print plot
+print(bp_bray.curtis_pcoa)
+
+```
+
+##### Jaccard Distance
+```{r Ordination Plots PCoA Jaccard}
+# set ordination method
+bp_ord2 <- ordinate(bracken_physeq, "PCoA", "jaccard")
+
+#plot ordination
+bp_jaccard_pcoa <- plot_ordination(bracken_physeq, bp_ord2, type="samples", color="Product", shape = "Sample_Type", title="Microbiome PCoA: Jaccard Distance")
+
+# plot aesthetics
+bp_jaccard_pcoa <- bp_jaccard_pcoa + 
+  labs(color="Product", shape="Sample Type")
+#  geom_text_repel(label = sample_names(bracken_physeq), show.legend = FALSE) +
+#  theme(legend.title = element_text(size = 14),
+#        legend.text = element_text(face = "bold", size = 10),
+#        title = element_text(face = "bold", size = 14),
+#        axis.title.x = element_text(face = "bold", size = 13),
+#        axis.title.y = element_text(face = "bold", size = 13),
+#        axis.text.x = element_text(size = 12),
+#        axis.text.y = element_text(size = 12))
+
+# print plot
+print(bp_jaccard_pcoa)
+```
+
+
+#### Beta Diversity: Distances
+
+##### Bray-Curtis PCoA
+```{r Normalized Counts PCoA Bray-Curtis}
+# set orination parameters
+bp_norm_ord1 <- ordinate(bp_norm_beta, "PCoA", "bray")
+
+# plot ordination
+bp_norm_pcoa_bc <- plot_ordination(bp_norm, bp_norm_ord1, type="samples", color="Product", shape = "Sample_Type", title="Microbiome PCoA: Bray-Curtis; Normalized")
+
+# aesthetics of ordination plot
+bp_norm_pcoa_bc <- bp_norm_pcoa_bc + 
+  labs(color="Product", shape="Sample Type") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_text(face = "bold", size = 13),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12))
+
+# print plot
+print(bp_norm_pcoa_bc)
+
+# save plot
+ggsave("./beta_plots/beta_pca_bray_norm.pdf", bp_norm_pcoa_bc, width = 22, height = 12)
+
+```
+
+#### Subset by Sample Type
+```{r}
+bp_beta_norm_saliva <- subset_samples(bp_norm_beta, Sample_Type == "Saliva")
+bp_beta_norm_fecal <- subset_samples(bp_norm_beta, Sample_Type == "Fecal")
+bp_beta_norm_saliva
+```
+
+##### Saliva; normalized PCoA - Bray
+```{r Normalized Counts PCoA Bray-Curtis}
+# set orination parameters
+beta_norm_saliva_ord1 <- ordinate(bp_beta_norm_saliva, "PCoA", "bray")
+
+# plot ordination
+beta_norm_bray_pca_saliva <- plot_ordination(bp_beta_norm_saliva, beta_norm_saliva_ord1, type="samples", color="Product", title="Saliva Microbiome PCoA: Bray-Curtis; Normalized")
+
+# aesthetics of ordination plot
+beta_norm_bray_pca_saliva <- beta_norm_bray_pca_saliva + 
+  labs(color="Product") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_text(face = "bold", size = 13),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12))
+
+# print plot
+print(beta_norm_bray_pca_saliva)
+
+# save plot
+ggsave("./beta_plots/saliva_beta_pca_bray_norm.pdf", beta_norm_bray_pca_saliva, width = 22, height = 12)
+
+```
+
+##### Fecal; normalized PCoA - Bray
+```{r Normalized Counts PCoA Bray-Curtis}
+# set orination parameters
+beta_norm_fecal_ord1 <- ordinate(bp_beta_norm_fecal, "PCoA", "bray")
+
+# plot ordination
+beta_norm_bray_pca_fecal <- plot_ordination(bp_beta_norm_fecal, beta_norm_fecal_ord1, type="samples", color="Product", title="Fecal Microbiome PCoA: Bray-Curtis; Normalized")
+
+# aesthetics of ordination plot
+beta_norm_bray_pca_fecal <- beta_norm_bray_pca_fecal + 
+  labs(color="Product") +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_text(face = "bold", size = 13),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12))
+
+# print plot
+print(beta_norm_bray_pca_fecal)
+
+# save plot
+ggsave("./beta_plots/fecal_beta_pca_bray_norm.pdf", beta_norm_bray_pca_fecal, width = 22, height = 12)   
+
+```
+
+##### Jaccard - PCoA
+```{r Normalized Counts PCoA Bray-Curtis}
+# set orination parameters
+bp_norm_ord2 <- ordinate(bp_norm, "PCoA", "jaccard")
+
+# plot ordination
+bp_norm_pcoa_jac <- plot_ordination(bp_norm, bp_norm_ord2, type="samples", color="Product", shape = "Sample_Type",  title="Microbiome PCoA: Jaccard; Normalized")
+
+# aesthetics of ordination plot
+bp_norm_pcoa_jac <- bp_norm_pcoa_jac + 
+  labs(color="Patient Type")
+#  geom_text_repel(label = sample_names(bp_norm), show.legend = FALSE) +
+#  theme(legend.title = element_text(size = 14),
+#        legend.text = element_text(face = "bold", size = 10),
+#        title = element_text(face = "bold", size = 14),
+#        axis.title.x = element_text(face = "bold", size = 13),
+#        axis.title.y = element_text(face = "bold", size = 13),
+#        axis.text.x = element_text(size = 12),
+#        axis.text.y = element_text(size = 12))
+
+# print plot
+print(bp_norm_pcoa_jac)
+
+```
+
+##### Bray - NMDS
+```{r Normalized Counts PCoA Bray-Curtis}
+# set orination parameters
+bp_norm_ord3 <- ordinate(bp_norm, "NMDS", "bray")
+
+# plot ordination
+bp_norm_nmds_bray <- plot_ordination(bp_norm, bp_norm_ord3, type="samples", color="Product", shape = "Sample_Type",  title="Microbiome NMDS: Bray; Normalized")
+
+# aesthetics of ordination plot
+bp_norm_nmds_bray <- bp_norm_nmds_bray + 
+  labs(color="Product")
+#  geom_text_repel(label = sample_names(bp_norm), show.legend = FALSE) +
+#  theme(legend.title = element_text(size = 14),
+#        legend.text = element_text(face = "bold", size = 10),
+#        title = element_text(face = "bold", size = 14),
+#        axis.title.x = element_text(face = "bold", size = 13),
+#        axis.title.y = element_text(face = "bold", size = 13),
+#        axis.text.x = element_text(size = 12),
+#        axis.text.y = element_text(size = 12))
+
+# print plot
+print(bp_norm_nmds_bray)
+
+```
+
+##### Jaccard - NMDS
+```{r Normalized Counts PCoA Bray-Curtis}
+# set orination parameters
+bp_norm_ord4 <- ordinate(bp_norm, "NMDS", "jaccard")
+
+# plot ordination
+bp_norm_nmds_jac <- plot_ordination(bp_norm, bp_norm_ord4, type="samples", color="Product", shape = "Sample_Type",  title="Microbiome NMDS: Jaccard; Normalized")
+
+# aesthetics of ordination plot
+bp_norm_nmds_jac <- bp_norm_nmds_jac + 
+  labs(color="Product")
+#  geom_text_repel(label = sample_names(bp_norm), show.legend = FALSE) +
+#  theme(legend.title = element_text(size = 14),
+#        legend.text = element_text(face = "bold", size = 10),
+#        title = element_text(face = "bold", size = 14),
+#        axis.title.x = element_text(face = "bold", size = 13),
+#        axis.title.y = element_text(face = "bold", size = 13),
+#        axis.text.x = element_text(size = 12),
+#        axis.text.y = element_text(size = 12))
+
+# print plot
+print(bp_norm_nmds_jac)
+
+```
+
+#### Bacteria Only
+```{r bp bacteria only}
+# subset to keep only bacteria
+bp_norm_bac <- subset_taxa(bp_norm, Kingdom =="Bacteria")
+
+# number of taxa surviving
+ntaxa(bp_norm_bac)
+
+```
+
+##### Beta Diversity: Ordination Plot of Bacteria Subset
+
+```{r Beta Diversity Bacteria Only 1}
+# Keep only most abundant 10 Phyla
+phylum.sum <- tapply(taxa_sums(bp_norm_bac), tax_table(bp_norm_bac)[, "Phylum"], sum, na.rm=TRUE)
+top10phyla <- names(sort(phylum.sum, TRUE))[1:10]
+bp_norm_bac <- prune_taxa((tax_table(bp_norm_bac)[, "Phylum"] %in% top10phyla), bp_norm_bac)
+
+# n taxa surviving
+ntaxa(bp_norm_bac)
+```
+
+##### NMDS: Bray-Curtis Dissimilarity
+```{r Beta Diversity Bacteria Only 2}
+
+bp_norm_bac.ord1 <- ordinate(bp_norm_bac, "NMDS", "bray")
+
+bp_norm_bac_p1 <- plot_ordination(bp_norm_bac, bp_norm_bac.ord1, type = "sample", color = "Patient_Type",
+                                  title = "OVF Microbiome: NMDS Bray-Curtis; Bacteria only") +
+  labs(color="Patient Type") +
+  geom_text_repel(label = sample_names(bp_norm_bac), show.legend = FALSE) +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_text(face = "bold", size = 13),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12))
+bp_norm_bac_p1
+```
+
+##### PCoA/MDS: Jaccard Distance
+```{r Beta Diversity Bacteria Only 3}
+
+bp_norm_bac.ord2 <- ordinate(bp_norm_bac, "PCoA", "jaccard")
+
+bp_norm_bac_p2 <- plot_ordination(bp_norm_bac, bp_norm_bac.ord2, type = "sample", color = "Patient_Type",
+                                  title = "OVF Microbiome: PCoA Jaccard; Bacteria only") +
+  labs(color="Patient Type") +
+  geom_text_repel(label = sample_names(bp_norm_bac), show.legend = FALSE) +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_text(face = "bold", size = 13),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12))
+bp_norm_bac_p2
+```
+
+#### Viruses Only
+```{r bp viruses only}
+# subset to keep only bacteria
+bp_norm_vir <- subset_taxa(bp_norm, Kingdom =="Viruses")
+
+# number of taxa surviving
+ntaxa(bp_norm_vir)
+
+```
+
+##### NMDS: Bray-Curtis Dissimilarity
+```{r Beta Diversity Viruses Only 2}
+
+bp_norm_vir.ord1 <- ordinate(bp_norm_vir, "NMDS", "bray")
+
+bp_norm_vir_p1 <- plot_ordination(bp_norm_vir, bp_norm_vir.ord1, type = "sample", color = "Patient_Type",
+                                  title = "OVF Microbiome: NMDS Bray-Curtis; Viruses only") +
+  labs(color="Patient Type") +
+  geom_text_repel(label = sample_names(bp_norm_vir), show.legend = FALSE) +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_text(face = "bold", size = 13),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12))
+bp_norm_vir_p1
+```
+
+##### PCoA/MDS: Jaccard Distance
+```{r Beta Diversity Viruses Only 3}
+
+bp_norm_vir.ord2 <- ordinate(bp_norm_vir, "PCoA", "bray")
+
+bp_norm_vir_p2 <- plot_ordination(bp_norm_vir, bp_norm_vir.ord2, type = "sample", color = "Patient_Type",
+                                  title = "OVF Microbiome: PCoA Bray; Viruses only") +
+  labs(color="Patient Type") +
+  geom_text_repel(label = sample_names(bp_norm_vir), show.legend = FALSE) +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_text(face = "bold", size = 13),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12))
+bp_norm_vir_p2
+```
+
+#### Archaea Only
+```{r bp archaea only}
+# subset to keep only bacteria
+bp_norm_arc <- subset_taxa(bp_norm, Kingdom =="Archaea")
+
+# number of taxa surviving
+ntaxa(bp_norm_arc)
+
+```
+
+##### NMDS: Bray-Curtis Dissimilarity
+```{r Beta Diversity Viruses Only 2}
+
+bp_norm_arc.ord1 <- ordinate(bp_norm_arc, "NMDS", "bray")
+
+bp_norm_arc_p1 <- plot_ordination(bp_norm_arc, bp_norm_arc.ord1, type = "sample", color = "Patient_Type",
+                                  title = "OVF Microbiome: NMDS Bray-Curtis; Archaea only") +
+  labs(color="Patient Type") +
+  geom_text_repel(label = sample_names(bp_norm_arc), show.legend = FALSE) +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_text(face = "bold", size = 13),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12))
+bp_norm_arc_p1
+```
+
+##### PCoA/MDS: Jaccard Distance
+```{r Beta Diversity Viruses Only 3}
+
+bp_norm_arc.ord2 <- ordinate(bp_norm_arc, "PCoA", "bray")
+
+bp_norm_arc_p2 <- plot_ordination(bp_norm_arc, bp_norm_arc.ord2, type = "sample", color = "Patient_Type",
+                                  title = "OVF Microbiome: PCoA Bray; Archaea only") +
+  labs(color="Patient Type") +
+  geom_text_repel(label = sample_names(bp_norm_arc), show.legend = FALSE) +
+  theme(legend.title = element_text(size = 14),
+        legend.text = element_text(face = "bold", size = 10),
+        title = element_text(face = "bold", size = 14),
+        axis.title.x = element_text(face = "bold", size = 13),
+        axis.title.y = element_text(face = "bold", size = 13),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12))
+bp_norm_arc_p2
+```
+
+## Differential Abundance Testing
+
+> Using Negative Binomial in Microbiome Differential Abundance Testing
+
+#### Convert Phyloseq object to DESeq2 object
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bracken_physeq
+
+# Check Product Factor
+head(sample_data(bracken_physeq)$Product, n=4)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Patient Type
+bp_prod_dds <- phyloseq_to_deseq2(bracken_physeq, ~Product)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_prod_geoMeans = apply(counts(bp_prod_dds), 1, gm_mean)
+bp_prod_dds = estimateSizeFactors(bp_prod_dds, geoMeans=bp_prod_geoMeans)
+bp_prod_dds = DESeq(bp_prod_dds, fitType="local")
+
+```
+
+## Subset by Product
+
+### Product A
+```{r}
+# Subset Phyloseq Dataset samples for "Product A"
+bp_norm_A <- subset_samples(bp_norm, Product == "A")
+# remove low count taxa from data
+bp_norm_A <- prune_taxa(taxa_sums(bp_norm_A) > 5000, bp_norm_A)
+```
+
+##### Select Top 9 Phyla
+```{r}
+phylum.sum_A = tapply(taxa_sums(bp_norm_A), tax_table(bp_norm_A)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_A = names(sort(phylum.sum_A, TRUE))[1:8]
+bp_norm_A = prune_taxa((tax_table(bp_norm_A)[, "Phylum"] %in% top5phyla_A), bp_norm_A)
+```
+
+
+##### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_A
+
+# Check Sample_Type Factor
+head(sample_data(bp_norm_A)$Sample_Type, n=2)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Patient Type
+bp_A_dds <- phyloseq_to_deseq2(bp_norm_A, ~Sample_Type)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_A_geoMeans = apply(counts(bp_A_dds), 1, gm_mean)
+bp_A_dds = estimateSizeFactors(bp_A_dds, geoMeans=bp_A_geoMeans)
+bp_A_dds = DESeq(bp_A_dds, test = "Wald", fitType="parametric")
+
+```
+##### Investigate Test Table Results
+
+##### Oral vs Fecal
+
+```{r}
+bp_results_A <- results(bp_A_dds, contrast = c("Sample_Type", "Saliva", "Fecal"))
+mcols(bp_results_A)$description
+bp_results_A = bp_results_A[order(bp_results_A$padj, na.last=NA), ]
+head(bp_results_A)
+alpha = 0.001
+bp_A_sigtab = bp_results_A[(bp_results_A$padj < alpha), ]
+bp_A_sigtab = cbind(as(bp_A_sigtab, "data.frame"), as(tax_table(bp_norm_A)[rownames(bp_A_sigtab), ], "matrix"))
+head(bp_A_sigtab)
+
+write.csv(bp_A_sigtab, "./deseq2_output/MARS_bracken_diff_abund_deseq2_product_A.csv")
+```
+
+##### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for condition **Saliva** vs **Fecal** means that the **Saliva** Sample Type had a multiplicative change in observed read abundance of 2^−1=0.5 compared to the **Fecal** Sample Type. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+##### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_A = subset(bp_A_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_A$log2FoldChange, sigtabgen_A$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_A$Phylum = factor(as.character(sigtabgen_A$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_A$log2FoldChange, sigtabgen_A$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_A$Genus = factor(as.character(sigtabgen_A$Genus), levels=names(x))
+
+# Plot
+bp_a_da_plot <- ggplot(sigtabgen_A, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = -90,
+                                   hjust = 0,
+                                   vjust=0.5,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Product A: Saliva vs. Fecal Microbiome Differential Abundance") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.001)")
+
+bp_a_da_plot
+
+# save plot
+ggsave("./deseq2_output/plots/bp_diff_abund_prod_A.pdf", bp_a_da_plot, width = 22, height = 12)
+```
+
+### Product B
+```{r}
+# Subset Phyloseq Dataset samples for "Product B"
+bp_norm_B <- subset_samples(bp_norm, Product == "B")
+# remove taxa from data with counts below 5000 reads
+bp_norm_B <- prune_taxa(taxa_sums(bp_norm_B) > 5000, bp_norm_B)
+```
+
+##### Select Top 9 Phyla
+```{r}
+phylum.sum_B = tapply(taxa_sums(bp_norm_B), tax_table(bp_norm_B)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_B = names(sort(phylum.sum_B, TRUE))[1:8]
+bp_norm_B = prune_taxa((tax_table(bp_norm_B)[, "Phylum"] %in% top5phyla_B), bp_norm_B)
+```
+
+
+##### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_B
+
+# Check Sample_Type Factor
+head(sample_data(bp_norm_B)$Sample_Type, n=2)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Patient Type
+bp_B_dds <- phyloseq_to_deseq2(bp_norm_B, ~Sample_Type)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_B_geoMeans = apply(counts(bp_B_dds), 1, gm_mean)
+bp_B_dds = estimateSizeFactors(bp_B_dds, geoMeans=bp_B_geoMeans)
+bp_B_dds = DESeq(bp_B_dds, test = "Wald", fitType="parametric")
+
+```
+##### Investigate Test Table Results
+##### Oral vs Fecal
+
+```{r}
+bp_results_B <- results(bp_B_dds, contrast = c("Sample_Type", "Saliva", "Fecal"))
+mcols(bp_results_B)$description
+bp_results_B = bp_results_B[order(bp_results_B$padj, na.last=NA), ]
+head(bp_results_B)
+alpha = 0.001
+bp_B_sigtab = bp_results_B[(bp_results_B$padj < alpha), ]
+bp_B_sigtab = cbind(as(bp_B_sigtab, "data.frame"), as(tax_table(bp_norm_B)[rownames(bp_B_sigtab), ], "matrix"))
+head(bp_B_sigtab)
+
+write.csv(bp_B_sigtab, "./deseq2_output/MARS_bracken_diff_abund_deseq2_product_B.csv")
+```
+
+##### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for condition **Saliva** vs **Fecal** means that the **Saliva** Sample Type had a multiplicative change in observed read abundance of 2^−1=0.5 compared to the **Fecal** Sample Type. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+##### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_B = subset(bp_B_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_B$log2FoldChange, sigtabgen_B$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_B$Phylum = factor(as.character(sigtabgen_B$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_B$log2FoldChange, sigtabgen_B$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_B$Genus = factor(as.character(sigtabgen_B$Genus), levels=names(x))
+
+# Plot
+bp_B_da_plot <- ggplot(sigtabgen_B, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = -90,
+                                   hjust = 0,
+                                   vjust=0.5,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Product B: Saliva vs. Fecal Microbiome Differential Abundance") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.001)")
+
+bp_B_da_plot
+
+# save plot
+ggsave("./deseq2_output/plots/bp_diff_abund_prod_B.pdf", bp_B_da_plot, width = 22, height = 12)
+```
+
+### Product C
+```{r}
+# Subset Phyloseq Dataset samples for "Product A"
+bp_norm_C <- subset_samples(bp_norm, Product == "C")
+# remove taxa from data with counts below 5000 reads
+bp_norm_C <- prune_taxa(taxa_sums(bp_norm_C) > 5000, bp_norm_C)
+```
+
+##### Select Top 9 Phyla
+```{r}
+phylum.sum_C = tapply(taxa_sums(bp_norm_C), tax_table(bp_norm_C)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_C = names(sort(phylum.sum_C, TRUE))[1:8]
+bp_norm_C = prune_taxa((tax_table(bp_norm_C)[, "Phylum"] %in% top5phyla_C), bp_norm_C)
+```
+
+
+##### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_C
+
+# Check Sample_Type Factor
+head(sample_data(bp_norm_C)$Sample_Type, n=2)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Patient Type
+bp_C_dds <- phyloseq_to_deseq2(bp_norm_C, ~Sample_Type)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_C_geoMeans = apply(counts(bp_C_dds), 1, gm_mean)
+bp_C_dds = estimateSizeFactors(bp_C_dds, geoMeans=bp_C_geoMeans)
+bp_C_dds = DESeq(bp_C_dds, test = "Wald", fitType="parametric")
+
+```
+#### Investigate Test Table Results
+
+##### Oral vs Fecal
+
+```{r}
+bp_results_C <- results(bp_C_dds, contrast = c("Sample_Type", "Saliva", "Fecal"))
+mcols(bp_results_C)$description
+bp_results_C = bp_results_C[order(bp_results_C$padj, na.last=NA), ]
+head(bp_results_C)
+alpha = 0.001
+bp_C_sigtab = bp_results_C[(bp_results_C$padj < alpha), ]
+bp_C_sigtab = cbind(as(bp_C_sigtab, "data.frame"), as(tax_table(bp_norm_C)[rownames(bp_C_sigtab), ], "matrix"))
+head(bp_C_sigtab)
+
+write.csv(bp_C_sigtab, "./deseq2_output/MARS_bracken_diff_abund_deseq2_product_C.csv")
+```
+
+##### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for condition **Saliva** vs **Fecal** means that the **Saliva** Sample Type had a multiplicative change in observed read abundance of 2^−1=0.5 compared to the **Fecal** Sample Type. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+##### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_C = subset(bp_C_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_C$log2FoldChange, sigtabgen_C$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_C$Phylum = factor(as.character(sigtabgen_C$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_C$log2FoldChange, sigtabgen_C$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_C$Genus = factor(as.character(sigtabgen_C$Genus), levels=names(x))
+
+# Plot
+bp_C_da_plot <- ggplot(sigtabgen_C, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = -90,
+                                   hjust = 0,
+                                   vjust=0.5,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Product C: Saliva vs. Fecal Microbiome Differential Abundance") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.001)")
+
+bp_C_da_plot
+
+# save plot
+ggsave("./deseq2_output/plots/bp_diff_abund_prod_C.pdf", bp_C_da_plot, width = 22, height = 12)
+```
+
+### Product D
+```{r}
+# Subset Phyloseq Dataset samples for "Product D"
+bp_norm_D <- subset_samples(bp_norm, Product == "D")
+# remove taxa from data with counts below 5000 reads
+bp_norm_D <- prune_taxa(taxa_sums(bp_norm_D) > 5000, bp_norm_D)
+```
+
+##### Select Top 9 Phyla
+```{r}
+phylum.sum_D = tapply(taxa_sums(bp_norm_D), tax_table(bp_norm_D)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_D = names(sort(phylum.sum_D, TRUE))[1:8]
+bp_norm_D = prune_taxa((tax_table(bp_norm_D)[, "Phylum"] %in% top5phyla_D), bp_norm_D)
+```
+
+
+##### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_D
+
+# Check Sample_Type Factor
+head(sample_data(bp_norm_D)$Sample_Type, n=2)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Patient Type
+bp_D_dds <- phyloseq_to_deseq2(bp_norm_D, ~Sample_Type)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_D_geoMeans = apply(counts(bp_D_dds), 1, gm_mean)
+bp_D_dds = estimateSizeFactors(bp_D_dds, geoMeans=bp_D_geoMeans)
+bp_D_dds = DESeq(bp_D_dds, test = "Wald", fitType="parametric")
+
+```
+##### Investigate Test Table Results
+
+##### Oral vs Fecal
+
+```{r}
+bp_results_D <- results(bp_D_dds, contrast = c("Sample_Type", "Saliva", "Fecal"))
+mcols(bp_results_D)$description
+bp_results_D = bp_results_D[order(bp_results_D$padj, na.last=NA), ]
+head(bp_results_D)
+alpha = 0.001
+bp_D_sigtab = bp_results_D[(bp_results_D$padj < alpha), ]
+bp_D_sigtab = cbind(as(bp_D_sigtab, "data.frame"), as(tax_table(bp_norm_D)[rownames(bp_D_sigtab), ], "matrix"))
+head(bp_D_sigtab)
+
+write.csv(bp_D_sigtab, "./deseq2_output/MARS_bracken_diff_abund_deseq2_product_D.csv")
+```
+
+##### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for condition **Saliva** vs **Fecal** means that the **Saliva** Sample Type had a multiplicative change in observed read abundance of 2^−1=0.5 compared to the **Fecal** Sample Type. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+##### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_D = subset(bp_D_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_D$log2FoldChange, sigtabgen_D$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_D$Phylum = factor(as.character(sigtabgen_D$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_D$log2FoldChange, sigtabgen_D$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_D$Genus = factor(as.character(sigtabgen_D$Genus), levels=names(x))
+
+# Plot
+bp_D_da_plot <- ggplot(sigtabgen_D, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = -90,
+                                   hjust = 0,
+                                   vjust=0.5,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Product D: Saliva vs. Fecal Microbiome Differential Abundance") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.001)")
+
+bp_D_da_plot
+
+# save plot
+ggsave("./deseq2_output/plots/bp_diff_abund_prod_D.pdf", bp_D_da_plot, width = 22, height = 12)
+```
+
+## Subset by Sample Type
+
+### Saliva Subset
+
+```{r}
+# Subset Phyloseq Dataset samples for "Saliva" Sample Type
+bp_norm_saliva <- subset_samples(bp_norm, Sample_Type == "Saliva")
+# remove taxa from data with counts below 5000 reads
+bp_norm_saliva <- prune_taxa(taxa_sums(bp_norm_saliva) > 5000, bp_norm_saliva)
+```
+
+#### Select Top 9 Phyla
+```{r}
+phylum.sum_saliva = tapply(taxa_sums(bp_norm_saliva), tax_table(bp_norm_saliva)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_saliva = names(sort(phylum.sum_saliva, TRUE))[1:8]
+bp_norm_saliva = prune_taxa((tax_table(bp_norm_saliva)[, "Phylum"] %in% top5phyla_saliva), bp_norm_saliva)
+```
+
+#### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_saliva
+
+# Check Product Factor
+head(sample_data(bp_norm_saliva)$Product, n=4)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Patient Type
+bp_saliva_dds <- phyloseq_to_deseq2(bp_norm_saliva, ~Product)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_saliva_geoMeans = apply(counts(bp_saliva_dds), 1, gm_mean)
+bp_saliva_dds = estimateSizeFactors(bp_saliva_dds, geoMeans=bp_saliva_geoMeans)
+bp_saliva_dds = DESeq(bp_saliva_dds, test = "Wald", fitType="parametric")
+
+```
+#### Product Contrasts
+
+##### A vs B
+
+```{r}
+bp_results_saliva_AB <- results(bp_saliva_dds, contrast = c("Product", "A", "B"))
+mcols(bp_results_saliva_AB)$description
+bp_results_saliva_AB = bp_results_saliva_AB[order(bp_results_saliva_AB$padj, na.last=NA), ]
+head(bp_results_saliva_AB)
+alpha = 0.01
+bp_saliva_AB_sigtab = bp_results_saliva_AB[(bp_results_saliva_AB$padj < alpha), ]
+bp_saliva_AB_sigtab = cbind(as(bp_saliva_AB_sigtab, "data.frame"), as(tax_table(bp_norm_saliva)[rownames(bp_saliva_AB_sigtab), ], "matrix"))
+head(bp_saliva_AB_sigtab)
+
+write.csv(bp_saliva_AB_sigtab, "./deseq2_output/MARS_saliva_bracken_deseq2_diff_abund_prod_AB.csv")
+```
+
+###### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for **Product A** vs **Product B** means that Saliva microbiomes of individuals who received **Product A**  had a multiplicative change in observed read abundance of 2^−1=0.5 compared to those of individuals receiving **Product B**. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+###### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_saliva_AB = subset(bp_saliva_AB_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_saliva_AB$log2FoldChange, sigtabgen_saliva_AB$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_AB$Phylum = factor(as.character(sigtabgen_saliva_AB$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_saliva_AB$log2FoldChange, sigtabgen_saliva_AB$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_AB$Genus = factor(as.character(sigtabgen_saliva_AB$Genus), levels=names(x))
+
+# Plot
+bp_diff_abund_saliva_AB_plot <- ggplot(sigtabgen_saliva_AB, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1.05,
+                                   vjust=1.05,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially Abundant Taxa of the Saliva Microbiome: Product A vs. Product B") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.01)") + 
+  geom_label_repel(label = sigtabgen_saliva_AB$Species2, show.legend = FALSE)
+
+bp_diff_abund_saliva_AB_plot
+
+# save plot
+ggsave("./deseq2_output/plots/saliva_bp_diff_abund_AB.pdf", bp_diff_abund_saliva_AB_plot, width = 22, height = 12)
+```
+
+##### A vs C
+```{r}
+bp_results_saliva_AC <- results(bp_saliva_dds, contrast = c("Product", "A", "C"))
+mcols(bp_results_saliva_AC)$description
+bp_results_saliva_AC = bp_results_saliva_AC[order(bp_results_saliva_AC$padj, na.last=NA), ]
+head(bp_results_saliva_AC)
+alpha = 0.01
+bp_saliva_AC_sigtab = bp_results_saliva_AC[(bp_results_saliva_AC$padj < alpha), ]
+bp_saliva_AC_sigtab = cbind(as(bp_saliva_AC_sigtab, "data.frame"), as(tax_table(bp_norm_saliva)[rownames(bp_saliva_AC_sigtab), ], "matrix"))
+head(bp_saliva_AC_sigtab)
+
+write.csv(bp_saliva_AC_sigtab, "./deseq2_output/MARS_saliva_bracken_deseq2_diff_abund_prod_AC.csv")
+```
+
+###### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for Product **A** vs **C** means that Saliva microbiomes of individuals who received **Product A**  had a multiplicative change in observed read abundance of 2^−1=0.5 compared to those of individuals receiving **Product C**. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+###### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_saliva_AC = subset(bp_saliva_AC_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_saliva_AC$log2FoldChange, sigtabgen_saliva_AC$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_AC$Phylum = factor(as.character(sigtabgen_saliva_AC$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_saliva_AC$log2FoldChange, sigtabgen_saliva_AC$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_AC$Genus = factor(as.character(sigtabgen_saliva_AC$Genus), levels=names(x))
+
+# Plot
+bp_diff_abund_saliva_AC_plot <- ggplot(sigtabgen_saliva_AC, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1.05,
+                                   vjust=1.05,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially Abundant Taxa of the Saliva Microbiome: Product A vs. Product C") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.01)") + 
+  geom_label_repel(label = sigtabgen_saliva_AC$Species2, show.legend = FALSE)
+
+bp_diff_abund_saliva_AC_plot
+
+# save plot
+ggsave("./deseq2_output/plots/saliva_bp_diff_abund_AC.pdf", bp_diff_abund_saliva_AC_plot, width = 22, height = 12)
+```
+##### A vs D
+```{r}
+bp_results_saliva_AD <- results(bp_saliva_dds, contrast = c("Product", "A", "D"))
+mcols(bp_results_saliva_AD)$description
+bp_results_saliva_AD = bp_results_saliva_AD[order(bp_results_saliva_AD$padj, na.last=NA), ]
+head(bp_results_saliva_AD)
+alpha = 0.001
+bp_saliva_AD_sigtab = bp_results_saliva_AD[(bp_results_saliva_AD$padj < alpha), ]
+bp_saliva_AD_sigtab = cbind(as(bp_saliva_AD_sigtab, "data.frame"), as(tax_table(bp_norm_saliva)[rownames(bp_saliva_AD_sigtab), ], "matrix"))
+head(bp_saliva_AD_sigtab)
+
+write.csv(bp_saliva_AD_sigtab, "./deseq2_output/MARS_saliva_bracken_deseq2_diff_abund_prod_AD.csv")
+```
+
+###### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for Product **A** vs **D** means that Saliva microbiomes of individuals who received **Product A**  had a multiplicative change in observed read abundance of 2^−1=0.5 compared to those of individuals receiving **Product D**. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+###### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_saliva_AD = subset(bp_saliva_AD_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_saliva_AD$log2FoldChange, sigtabgen_saliva_AD$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_AD$Phylum = factor(as.character(sigtabgen_saliva_AD$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_saliva_AD$log2FoldChange, sigtabgen_saliva_AD$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_AD$Genus = factor(as.character(sigtabgen_saliva_AD$Genus), levels=names(x))
+
+# Plot
+bp_diff_abund_saliva_AD_plot <- ggplot(sigtabgen_saliva_AD, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1.05,
+                                   vjust=1.05,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially Abundant Taxa of the Saliva Microbiome: Product A vs. Product D") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.001)") + 
+  geom_label_repel(label = sigtabgen_saliva_AD$Species2, show.legend = FALSE)
+
+bp_diff_abund_saliva_AD_plot
+
+# save plot
+ggsave("./deseq2_output/plots/saliva_bp_diff_abund_AD.pdf", bp_diff_abund_saliva_AD_plot, width = 22, height = 12)
+```
+
+##### B vs C
+
+```{r}
+bp_results_saliva_BC <- results(bp_saliva_dds, contrast = c("Product", "B", "C"))
+mcols(bp_results_saliva_BC)$description
+bp_results_saliva_BC = bp_results_saliva_BC[order(bp_results_saliva_BC$padj, na.last=NA), ]
+head(bp_results_saliva_BC)
+alpha = 0.01
+bp_saliva_BC_sigtab = bp_results_saliva_BC[(bp_results_saliva_BC$padj < alpha), ]
+bp_saliva_BC_sigtab = cbind(as(bp_saliva_BC_sigtab, "data.frame"), as(tax_table(bp_norm_saliva)[rownames(bp_saliva_BC_sigtab), ], "matrix"))
+head(bp_saliva_BC_sigtab)
+
+write.csv(bp_saliva_BC_sigtab, "./deseq2_output/MARS_saliva_bracken_deseq2_diff_abund_prod_BC.csv")
+```
+
+###### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for Product **B** vs **C** means that Saliva microbiomes of individuals who received **Product B**  had a multiplicative change in observed read abundance of 2^−1=0.5 compared to those of individuals receiving **Product C**. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+###### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_saliva_BC = subset(bp_saliva_BC_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_saliva_BC$log2FoldChange, sigtabgen_saliva_BC$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_BC$Phylum = factor(as.character(sigtabgen_saliva_BC$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_saliva_BC$log2FoldChange, sigtabgen_saliva_BC$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_BC$Genus = factor(as.character(sigtabgen_saliva_BC$Genus), levels=names(x))
+
+# Plot
+bp_diff_abund_saliva_BC_plot <- ggplot(sigtabgen_saliva_BC, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1.05,
+                                   vjust=1.05,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially Abundant Taxa of the Saliva Microbiome: Product B vs. Product C") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.01)") + 
+  geom_label_repel(label = sigtabgen_saliva_BC$Species2, show.legend = FALSE)
+
+bp_diff_abund_saliva_BC_plot
+
+# save plot
+ggsave("./deseq2_output/plots/saliva_bp_diff_abund_BC.pdf", bp_diff_abund_saliva_BC_plot, width = 22, height = 12)
+```
+
+##### B vs D
+
+```{r}
+bp_results_saliva_BD <- results(bp_saliva_dds, contrast = c("Product", "B", "D"))
+mcols(bp_results_saliva_BD)$description
+bp_results_saliva_BD = bp_results_saliva_BD[order(bp_results_saliva_BD$padj, na.last=NA), ]
+head(bp_results_saliva_BD)
+alpha = 0.001
+bp_saliva_BD_sigtab = bp_results_saliva_BD[(bp_results_saliva_BD$padj < alpha), ]
+bp_saliva_BD_sigtab = cbind(as(bp_saliva_BD_sigtab, "data.frame"), as(tax_table(bp_norm_saliva)[rownames(bp_saliva_BD_sigtab), ], "matrix"))
+head(bp_saliva_BD_sigtab)
+
+write.csv(bp_saliva_BD_sigtab, "./deseq2_output/MARS_saliva_bracken_deseq2_diff_abund_prod_BD.csv")
+```
+
+###### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for Product **B** vs **D** means that Saliva microbiomes of individuals who received **Product B**  had a multiplicative change in observed read abundance of 2^−1=0.5 compared to those of individuals receiving **Product D**. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+###### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_saliva_BD = subset(bp_saliva_BD_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_saliva_BD$log2FoldChange, sigtabgen_saliva_BD$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_BD$Phylum = factor(as.character(sigtabgen_saliva_BD$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_saliva_BD$log2FoldChange, sigtabgen_saliva_BD$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_BD$Genus = factor(as.character(sigtabgen_saliva_BD$Genus), levels=names(x))
+
+# Plot
+bp_diff_abund_saliva_BD_plot <- ggplot(sigtabgen_saliva_BD, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1.05,
+                                   vjust=1.05,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially Abundant Taxa of the Saliva Microbiome: Product B vs. Product D") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.001)") + 
+  geom_label_repel(label = sigtabgen_saliva_BD$Species2, show.legend = FALSE)
+
+bp_diff_abund_saliva_BD_plot
+
+# save plot
+ggsave("./deseq2_output/plots/saliva_bp_diff_abund_BD.pdf", bp_diff_abund_saliva_BD_plot, width = 22, height = 12)
+```
+
+##### C vs D
+
+```{r}
+bp_results_saliva_CD <- results(bp_saliva_dds, contrast = c("Product", "C", "D"))
+mcols(bp_results_saliva_CD)$description
+bp_results_saliva_CD = bp_results_saliva_CD[order(bp_results_saliva_CD$padj, na.last=NA), ]
+head(bp_results_saliva_CD)
+alpha = 0.005
+bp_saliva_CD_sigtab = bp_results_saliva_CD[(bp_results_saliva_CD$padj < alpha), ]
+bp_saliva_CD_sigtab = cbind(as(bp_saliva_CD_sigtab, "data.frame"), as(tax_table(bp_norm_saliva)[rownames(bp_saliva_CD_sigtab), ], "matrix"))
+head(bp_saliva_CD_sigtab)
+
+write.csv(bp_saliva_CD_sigtab, "./deseq2_output/MARS_saliva_bracken_deseq2_diff_abund_prod_CD.csv")
+```
+
+###### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for Product **C** vs **D** means that Saliva microbiomes of individuals who received **Product C**  had a multiplicative change in observed read abundance of 2^−1=0.5 compared to those of individuals receiving **Product D**. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+###### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_saliva_CD = subset(bp_saliva_CD_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_saliva_CD$log2FoldChange, sigtabgen_saliva_CD$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_CD$Phylum = factor(as.character(sigtabgen_saliva_CD$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_saliva_CD$log2FoldChange, sigtabgen_saliva_CD$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_CD$Genus = factor(as.character(sigtabgen_saliva_CD$Genus), levels=names(x))
+
+# Plot
+bp_diff_abund_saliva_CD_plot <- ggplot(sigtabgen_saliva_CD, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1.05,
+                                   vjust=1.05,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially Abundant Taxa of the Saliva Microbiome: Product C vs. Product D") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.005)") + 
+  geom_label_repel(label = sigtabgen_saliva_CD$Species2, show.legend = FALSE)
+
+bp_diff_abund_saliva_CD_plot
+
+# save plot
+ggsave("./deseq2_output/plots/saliva_bp_diff_abund_CD.pdf", bp_diff_abund_saliva_CD_plot, width = 22, height = 12)
+```
+
+### Fecal Subset
+```{r}
+# Subset Phyloseq Dataset samples for "Saliva" Sample Type
+bp_norm_fecal <- subset_samples(bp_norm, Sample_Type == "Fecal")
+# remove taxa from data with counts below 5000 reads
+bp_norm_fecal <- prune_taxa(taxa_sums(bp_norm_fecal) > 5000, bp_norm_fecal)
+```
+
+#### Select Top 9 Phyla
+```{r}
+phylum.sum_fecal = tapply(taxa_sums(bp_norm_fecal), tax_table(bp_norm_fecal)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_fecal = names(sort(phylum.sum_fecal, TRUE))[1:8]
+bp_norm_fecal = prune_taxa((tax_table(bp_norm_fecal)[, "Phylum"] %in% top5phyla_fecal), bp_norm_fecal)
+```
+
+#### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_fecal
+
+# Check Product Factor
+head(sample_data(bp_norm_fecal)$Product, n=4)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Patient Type
+bp_fecal_dds <- phyloseq_to_deseq2(bp_norm_fecal, ~Product)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_fecal_geoMeans = apply(counts(bp_fecal_dds), 1, gm_mean)
+bp_fecal_dds = estimateSizeFactors(bp_fecal_dds, geoMeans=bp_fecal_geoMeans)
+bp_fecal_dds = DESeq(bp_fecal_dds, test = "Wald", fitType="parametric")
+
+```
+
+##### A vs B
+```{r}
+bp_results_fecal_AB <- results(bp_fecal_dds, contrast = c("Product", "A", "B"))
+mcols(bp_results_fecal_AB)$description
+bp_results_fecal_AB = bp_results_fecal_AB[order(bp_results_fecal_AB$padj, na.last=NA), ]
+head(bp_results_fecal_AB)
+alpha = 0.01
+bp_fecal_AB_sigtab = bp_results_fecal_AB[(bp_results_fecal_AB$padj < alpha), ]
+bp_fecal_AB_sigtab = cbind(as(bp_fecal_AB_sigtab, "data.frame"), as(tax_table(bp_norm_fecal)[rownames(bp_fecal_AB_sigtab), ], "matrix"))
+head(bp_fecal_AB_sigtab)
+
+write.csv(bp_fecal_AB_sigtab, "./deseq2_output/MARS_fecal_bracken_deseq2_diff_abund_prod_AB.csv")
+```
+
+###### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for **Product A** vs **Product B** means that Fecal microbiomes of individuals who received **Product A**  had a multiplicative change in observed read abundance of 2^−1=0.5 compared to those of individuals receiving **Product B**. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+###### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_fecal_AB = subset(bp_fecal_AB_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_fecal_AB$log2FoldChange, sigtabgen_fecal_AB$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_AB$Phylum = factor(as.character(sigtabgen_fecal_AB$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_fecal_AB$log2FoldChange, sigtabgen_fecal_AB$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_AB$Genus = factor(as.character(sigtabgen_fecal_AB$Genus), levels=names(x))
+
+# Plot
+bp_diff_abund_fecal_AB_plot <- ggplot(sigtabgen_fecal_AB, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1.05,
+                                   vjust=1.05,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially Abundant Taxa of the Fecal Microbiome: Product A vs. Product B") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.01)") + 
+  geom_label_repel(label = sigtabgen_fecal_AB$Species2, show.legend = FALSE)
+
+bp_diff_abund_fecal_AB_plot
+
+# save plot
+ggsave("./deseq2_output/plots/fecal_bp_diff_abund_AB.pdf", bp_diff_abund_fecal_AB_plot, width = 22, height = 12)
+```
+##### A vs C
+```{r}
+bp_results_fecal_AC <- results(bp_fecal_dds, contrast = c("Product", "A", "C"))
+mcols(bp_results_fecal_AC)$description
+bp_results_fecal_AC = bp_results_fecal_AC[order(bp_results_fecal_AC$padj, na.last=NA), ]
+head(bp_results_fecal_AC)
+alpha = 0.01
+bp_fecal_AC_sigtab = bp_results_fecal_AC[(bp_results_fecal_AC$padj < alpha), ]
+bp_fecal_AC_sigtab = cbind(as(bp_fecal_AC_sigtab, "data.frame"), as(tax_table(bp_norm_fecal)[rownames(bp_fecal_AC_sigtab), ], "matrix"))
+head(bp_fecal_AC_sigtab)
+
+write.csv(bp_fecal_AC_sigtab, "./deseq2_output/MARS_fecal_bracken_deseq2_diff_abund_prod_AC.csv")
+```
+
+###### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for Product **A** vs **C** means that Fecal microbiomes of individuals who received **Product A**  had a multiplicative change in observed read abundance of 2^−1=0.5 compared to those of individuals receiving **Product C**. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+###### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_fecal_AC = subset(bp_fecal_AC_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_fecal_AC$log2FoldChange, sigtabgen_fecal_AC$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_AC$Phylum = factor(as.character(sigtabgen_fecal_AC$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_fecal_AC$log2FoldChange, sigtabgen_fecal_AC$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_AC$Genus = factor(as.character(sigtabgen_fecal_AC$Genus), levels=names(x))
+
+# Plot
+bp_diff_abund_fecal_AC_plot <- ggplot(sigtabgen_fecal_AC, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1.05,
+                                   vjust=1.05,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially Abundant Taxa of the Fecal Microbiome: Product A vs. Product C") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.01)") + 
+  geom_label_repel(label = sigtabgen_fecal_AC$Species2, show.legend = FALSE)
+
+bp_diff_abund_fecal_AC_plot
+
+# save plot
+ggsave("./deseq2_output/plots/fecal_bp_diff_abund_AC.pdf", bp_diff_abund_fecal_AC_plot, width = 22, height = 12)
+```
+##### A vs D
+```{r}
+bp_results_fecal_AD <- results(bp_fecal_dds, contrast = c("Product", "A", "D"))
+mcols(bp_results_fecal_AD)$description
+bp_results_fecal_AD = bp_results_fecal_AD[order(bp_results_fecal_AD$padj, na.last=NA), ]
+head(bp_results_fecal_AD)
+alpha = 0.001
+bp_fecal_AD_sigtab = bp_results_fecal_AD[(bp_results_fecal_AD$padj < alpha), ]
+bp_fecal_AD_sigtab = cbind(as(bp_fecal_AD_sigtab, "data.frame"), as(tax_table(bp_norm_fecal)[rownames(bp_fecal_AD_sigtab), ], "matrix"))
+head(bp_fecal_AD_sigtab)
+
+write.csv(bp_fecal_AD_sigtab, "./deseq2_output/MARS_fecal_bracken_deseq2_diff_abund_prod_AD.csv")
+```
+
+###### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for Product **A** vs **D** means that Fecal microbiomes of individuals who received **Product A**  had a multiplicative change in observed read abundance of 2^−1=0.5 compared to those of individuals receiving **Product D**. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+###### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_fecal_AD = subset(bp_fecal_AD_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_fecal_AD$log2FoldChange, sigtabgen_fecal_AD$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_AD$Phylum = factor(as.character(sigtabgen_fecal_AD$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_fecal_AD$log2FoldChange, sigtabgen_fecal_AD$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_AD$Genus = factor(as.character(sigtabgen_fecal_AD$Genus), levels=names(x))
+
+# Plot
+bp_diff_abund_fecal_AD_plot <- ggplot(sigtabgen_fecal_AD, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1.05,
+                                   vjust=1.05,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially Abundant Taxa of the Fecal Microbiome: Product A vs. Product D") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.001)") + 
+  geom_label_repel(label = sigtabgen_fecal_AD$Species2, show.legend = FALSE)
+
+bp_diff_abund_fecal_AD_plot
+
+# save plot
+ggsave("./deseq2_output/plots/fecal_bp_diff_abund_AD.pdf", bp_diff_abund_fecal_AD_plot, width = 22, height = 12)
+```
+##### B vs C
+```{r}
+bp_results_fecal_BC <- results(bp_fecal_dds, contrast = c("Product", "B", "C"))
+mcols(bp_results_fecal_BC)$description
+bp_results_fecal_BC = bp_results_fecal_BC[order(bp_results_fecal_BC$padj, na.last=NA), ]
+head(bp_results_fecal_BC)
+alpha = 0.001
+bp_fecal_BC_sigtab = bp_results_fecal_BC[(bp_results_fecal_BC$padj < alpha), ]
+bp_fecal_BC_sigtab = cbind(as(bp_fecal_BC_sigtab, "data.frame"), as(tax_table(bp_norm_fecal)[rownames(bp_fecal_BC_sigtab), ], "matrix"))
+head(bp_fecal_BC_sigtab)
+
+write.csv(bp_fecal_BC_sigtab, "./deseq2_output/MARS_fecal_bracken_deseq2_diff_abund_prod_BC.csv")
+```
+
+###### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for Product **A** vs **D** means that Fecal microbiomes of individuals who received **Product A**  had a multiplicative change in observed read abundance of 2^−1=0.5 compared to those of individuals receiving **Product D**. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+###### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_fecal_BC = subset(bp_fecal_BC_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_fecal_BC$log2FoldChange, sigtabgen_fecal_BC$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_BC$Phylum = factor(as.character(sigtabgen_fecal_BC$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_fecal_BC$log2FoldChange, sigtabgen_fecal_BC$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_BC$Genus = factor(as.character(sigtabgen_fecal_BC$Genus), levels=names(x))
+
+# Plot
+bp_diff_abund_fecal_BC_plot <- ggplot(sigtabgen_fecal_BC, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1.05,
+                                   vjust=1.05,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially Abundant Taxa of the Fecal Microbiome: Product B vs. Product C") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.001)") + 
+  geom_label_repel(label = sigtabgen_fecal_BC$Species2, show.legend = FALSE)
+
+bp_diff_abund_fecal_BC_plot
+
+# save plot
+ggsave("./deseq2_output/plots/fecal_bp_diff_abund_BC.pdf", bp_diff_abund_fecal_BC_plot, width = 22, height = 12)
+```
+
+##### B vs D
+```{r}
+bp_results_fecal_BD <- results(bp_fecal_dds, contrast = c("Product", "B", "D"))
+mcols(bp_results_fecal_BD)$description
+bp_results_fecal_BD = bp_results_fecal_BD[order(bp_results_fecal_BD$padj, na.last=NA), ]
+head(bp_results_fecal_BD)
+alpha = 0.01
+bp_fecal_BD_sigtab = bp_results_fecal_BD[(bp_results_fecal_BD$padj < alpha), ]
+bp_fecal_BD_sigtab = cbind(as(bp_fecal_BD_sigtab, "data.frame"), as(tax_table(bp_norm_fecal)[rownames(bp_fecal_BD_sigtab), ], "matrix"))
+head(bp_fecal_BD_sigtab)
+
+write.csv(bp_fecal_BD_sigtab, "./deseq2_output/MARS_fecal_bracken_deseq2_diff_abund_prod_BD.csv")
+```
+
+###### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for Product **B** vs **D** means that Fecal microbiomes of individuals who received **Product B**  had a multiplicative change in observed read abundance of 2^−1=0.5 compared to those of individuals receiving **Product D**. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+###### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_fecal_BD = subset(bp_fecal_BD_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_fecal_BD$log2FoldChange, sigtabgen_fecal_BD$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_BD$Phylum = factor(as.character(sigtabgen_fecal_BD$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_fecal_BD$log2FoldChange, sigtabgen_fecal_BD$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_BD$Genus = factor(as.character(sigtabgen_fecal_BD$Genus), levels=names(x))
+
+# Plot
+bp_diff_abund_fecal_BD_plot <- ggplot(sigtabgen_fecal_BD, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1.05,
+                                   vjust=1.05,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially Abundant Taxa of the Fecal Microbiome: Product B vs. Product D") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.01)") + 
+  geom_label_repel(label = sigtabgen_fecal_BD$Species2, show.legend = FALSE)
+
+bp_diff_abund_fecal_BD_plot
+
+# save plot
+ggsave("./deseq2_output/plots/fecal_bp_diff_abund_BD.pdf", bp_diff_abund_fecal_BD_plot, width = 22, height = 12)
+```
+
+##### C vs D
+```{r}
+bp_results_fecal_CD <- results(bp_fecal_dds, contrast = c("Product", "C", "D"))
+mcols(bp_results_fecal_CD)$description
+bp_results_fecal_CD = bp_results_fecal_CD[order(bp_results_fecal_CD$padj, na.last=NA), ]
+head(bp_results_fecal_CD)
+alpha = 0.01
+bp_fecal_CD_sigtab = bp_results_fecal_CD[(bp_results_fecal_CD$padj < alpha), ]
+bp_fecal_CD_sigtab = cbind(as(bp_fecal_CD_sigtab, "data.frame"), as(tax_table(bp_norm_fecal)[rownames(bp_fecal_CD_sigtab), ], "matrix"))
+head(bp_fecal_CD_sigtab)
+
+write.csv(bp_fecal_CD_sigtab, "./deseq2_output/MARS_fecal_bracken_deseq2_diff_abund_prod_CD.csv")
+```
+
+###### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for Product **C** vs **D** means that Fecal microbiomes of individuals who received **Product B**  had a multiplicative change in observed read abundance of 2^−1=0.5 compared to those of individuals receiving **Product D**. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+###### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_fecal_CD = subset(bp_fecal_CD_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_fecal_CD$log2FoldChange, sigtabgen_fecal_CD$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_CD$Phylum = factor(as.character(sigtabgen_fecal_CD$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_fecal_CD$log2FoldChange, sigtabgen_fecal_CD$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_CD$Genus = factor(as.character(sigtabgen_fecal_CD$Genus), levels=names(x))
+
+# Plot
+bp_diff_abund_fecal_CD_plot <- ggplot(sigtabgen_fecal_CD, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1.05,
+                                   vjust=1.05,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Differentially Abundant Taxa of the Fecal Microbiome: Product C vs. Product D") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.01)") + 
+  geom_label_repel(label = sigtabgen_fecal_CD$Species2, show.legend = FALSE)
+
+bp_diff_abund_fecal_CD_plot
+
+# save plot
+ggsave("./deseq2_output/plots/fecal_bp_diff_abund_CD.pdf", bp_diff_abund_fecal_CD_plot, width = 22, height = 12)
+```
+
+## Subset: (Sample Type) x (Product)
+
+### Saliva Subset
+
+#### Product A
+```{r}
+# Subset Saliva Phyloseq Dataset samples for "Saliva" Sample Type
+bp_norm_saliva_A <- subset_samples(bp_norm_saliva, Product == "A")
+# remove taxa from data with counts below 5000 reads
+bp_norm_saliva_A <- prune_taxa(taxa_sums(bp_norm_saliva_A) > 50, bp_norm_saliva_A)
+```
+
+##### Select Top 9 Phyla
+```{r}
+phylum.sum_saliva_A = tapply(taxa_sums(bp_norm_saliva_A), tax_table(bp_norm_saliva_A)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_saliva_A = names(sort(phylum.sum_saliva_A, TRUE))[1:8]
+bp_norm_saliva_A = prune_taxa((tax_table(bp_norm_saliva_A)[, "Phylum"] %in% top5phyla_saliva_A), bp_norm_saliva_A)
+```
+
+##### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_saliva_A
+
+# Check Sample_Type Factor
+head(sample_data(bp_norm_saliva_A)$Timepoint, n=2)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Timepoint
+bp_saliva_A_dds <- phyloseq_to_deseq2(bp_norm_saliva_A, ~Timepoint)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_saliva_A_geoMeans = apply(counts(bp_saliva_A_dds), 1, gm_mean)
+bp_saliva_A_dds = estimateSizeFactors(bp_saliva_A_dds, geoMeans=bp_saliva_A_geoMeans)
+bp_saliva_A_dds = DESeq(bp_saliva_A_dds, test = "Wald", fitType="local")
+
+```
+##### Contrast Test Table Results
+
+##### Initial vs Final
+
+```{r}
+bp_results_saliva_A <- results(bp_saliva_A_dds, contrast = c("Timepoint", "Initial", "Final"))
+mcols(bp_results_saliva_A)$description
+bp_results_saliva_A = bp_results_saliva_A[order(bp_results_saliva_A$padj, na.last=NA), ]
+head(bp_results_saliva_A)
+alpha = 0.3
+bp_saliva_A_sigtab = bp_results_saliva_A[(bp_results_saliva_A$padj < alpha), ]
+bp_saliva_A_sigtab = cbind(as(bp_saliva_A_sigtab, "data.frame"), as(tax_table(bp_norm_saliva)[rownames(bp_saliva_A_sigtab), ], "matrix"))
+head(bp_saliva_A_sigtab)
+
+write.csv(bp_saliva_A_sigtab, "./deseq2_output/MARS_bracken_diff_abund_deseq2_saliva_product_A.csv")
+```
+
+##### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for condition **Saliva** vs **Fecal** means that the **Saliva** Sample Type had a multiplicative change in observed read abundance of 2^−1=0.5 compared to the **Fecal** Sample Type. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+##### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_saliva_A = subset(bp_saliva_A_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_saliva_A$log2FoldChange, sigtabgen_saliva_A$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_A$Phylum = factor(as.character(sigtabgen_saliva_A$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_saliva_A$log2FoldChange, sigtabgen_saliva_A$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_A$Genus = factor(as.character(sigtabgen_saliva_A$Genus), levels=names(x))
+
+# Plot
+bp_saliva_A_plot <- ggplot(sigtabgen_saliva_A, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = -90,
+                                   hjust = 0,
+                                   vjust=0.5,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Product A: Saliva Microbiome Differential Abundance by Time") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.5)") + 
+  geom_label_repel(label = sigtabgen_saliva_A$Species2, show.legend = FALSE)
+
+bp_saliva_A_plot
+
+# save plot
+ggsave("./deseq2_output/plots/bp_diff_abund_prod_A_saliva.pdf", bp_saliva_A_plot, width = 22, height = 12)
+```
+
+#### Product B
+```{r}
+# Subset Saliva Phyloseq Dataset samples for "Saliva" Sample Type
+bp_norm_saliva_B <- subset_samples(bp_norm_saliva, Product == "B")
+# remove taxa from data with counts below 5000 reads
+bp_norm_saliva_B <- prune_taxa(taxa_sums(bp_norm_saliva_B) > 50, bp_norm_saliva_B)
+```
+
+#### Select Top 9 Phyla
+```{r}
+phylum.sum_saliva_B = tapply(taxa_sums(bp_norm_saliva_B), tax_table(bp_norm_saliva_B)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_saliva_B = names(sort(phylum.sum_saliva_B, TRUE))[1:8]
+bp_norm_saliva_B = prune_taxa((tax_table(bp_norm_saliva_B)[, "Phylum"] %in% top5phyla_saliva_B), bp_norm_saliva_B)
+```
+
+##### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_saliva_B
+
+# Check Sample_Type Factor
+head(sample_data(bp_norm_saliva_B)$Timepoint, n=2)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Timepoint
+bp_saliva_B_dds <- phyloseq_to_deseq2(bp_norm_saliva_B, ~Timepoint)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_saliva_B_geoMeans = apply(counts(bp_saliva_B_dds), 1, gm_mean)
+bp_saliva_B_dds = estimateSizeFactors(bp_saliva_B_dds, geoMeans=bp_saliva_B_geoMeans)
+bp_saliva_B_dds = DESeq(bp_saliva_B_dds, test = "Wald", fitType="local")
+
+```
+##### Contrast Test Table Results
+
+##### Initial vs Final
+
+```{r}
+bp_results_saliva_B <- results(bp_saliva_B_dds, contrast = c("Timepoint", "Initial", "Final"))
+mcols(bp_results_saliva_B)$description
+bp_results_saliva_B = bp_results_saliva_B[order(bp_results_saliva_B$padj, na.last=NA), ]
+head(bp_results_saliva_B)
+alpha = 0.999
+bp_saliva_B_sigtab = bp_results_saliva_B[(bp_results_saliva_B$padj < alpha), ]
+bp_saliva_B_sigtab = cbind(as(bp_saliva_B_sigtab, "data.frame"), as(tax_table(bp_norm_saliva)[rownames(bp_saliva_B_sigtab), ], "matrix"))
+head(bp_saliva_B_sigtab)
+
+write.csv(bp_saliva_B_sigtab, "./deseq2_output/MARS_bracken_diff_abund_deseq2_saliva_product_B.csv")
+```
+
+##### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for condition **Saliva** vs **Fecal** means that the **Saliva** Sample Type had a multiplicative change in observed read abundance of 2^−1=0.5 compared to the **Fecal** Sample Type. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+##### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_saliva_B = subset(bp_saliva_B_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_saliva_B$log2FoldChange, sigtabgen_saliva_B$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_B$Phylum = factor(as.character(sigtabgen_saliva_B$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_saliva_B$log2FoldChange, sigtabgen_saliva_B$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_B$Genus = factor(as.character(sigtabgen_saliva_B$Genus), levels=names(x))
+
+# Plot
+bp_saliva_B_plot <- ggplot(sigtabgen_saliva_B, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = -90,
+                                   hjust = 0,
+                                   vjust=0.5,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Product B: Saliva Microbiome Differential Abundance by Time") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 1)") 
+  #geom_label_repel(label = sigtabgen_saliva_B$Species2, show.legend = FALSE)
+
+bp_saliva_B_plot
+
+# save plot
+ggsave("./deseq2_output/plots/bp_diff_abund_prod_B_saliva.pdf", bp_saliva_B_plot, width = 22, height = 12)
+```
+
+#### Product C
+```{r}
+# Subset Saliva Phyloseq Dataset samples for "Saliva" Sample Type
+bp_norm_saliva_C <- subset_samples(bp_norm_saliva, Product == "C")
+# remove taxa from data with counts below 5000 reads
+bp_norm_saliva_C <- prune_taxa(taxa_sums(bp_norm_saliva_C) > 50, bp_norm_saliva_C)
+```
+
+#### Select Top 9 Phyla
+```{r}
+phylum.sum_saliva_C = tapply(taxa_sums(bp_norm_saliva_C), tax_table(bp_norm_saliva_C)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_saliva_C = names(sort(phylum.sum_saliva_C, TRUE))[1:8]
+bp_norm_saliva_C = prune_taxa((tax_table(bp_norm_saliva_C)[, "Phylum"] %in% top5phyla_saliva_C), bp_norm_saliva_C)
+```
+
+##### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_saliva_C
+
+# Check Sample_Type Factor
+head(sample_data(bp_norm_saliva_C)$Timepoint, n=2)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Timepoint
+bp_saliva_C_dds <- phyloseq_to_deseq2(bp_norm_saliva_C, ~Timepoint)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_saliva_C_geoMeans = apply(counts(bp_saliva_C_dds), 1, gm_mean)
+bp_saliva_C_dds = estimateSizeFactors(bp_saliva_C_dds, geoMeans=bp_saliva_C_geoMeans)
+bp_saliva_C_dds = DESeq(bp_saliva_C_dds, test = "Wald", fitType="local")
+
+```
+##### Contrast Test Table Results
+
+##### Initial vs Final
+
+```{r}
+bp_results_saliva_C <- results(bp_saliva_C_dds, contrast = c("Timepoint", "Initial", "Final"))
+mcols(bp_results_saliva_C)$description
+bp_results_saliva_C = bp_results_saliva_C[order(bp_results_saliva_C$padj, na.last=NA), ]
+head(bp_results_saliva_C)
+alpha = 0.2
+bp_saliva_C_sigtab = bp_results_saliva_C[(bp_results_saliva_C$padj < alpha), ]
+bp_saliva_C_sigtab = cbind(as(bp_saliva_C_sigtab, "data.frame"), as(tax_table(bp_norm_saliva)[rownames(bp_saliva_C_sigtab), ], "matrix"))
+head(bp_saliva_C_sigtab)
+
+write.csv(bp_saliva_C_sigtab, "./deseq2_output/MARS_bracken_diff_abund_deseq2_saliva_product_C.csv")
+```
+
+##### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for condition **Saliva** vs **Fecal** means that the **Saliva** Sample Type had a multiplicative change in observed read abundance of 2^−1=0.5 compared to the **Fecal** Sample Type. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+##### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_saliva_C = subset(bp_saliva_C_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_saliva_C$log2FoldChange, sigtabgen_saliva_C$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_C$Phylum = factor(as.character(sigtabgen_saliva_C$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_saliva_C$log2FoldChange, sigtabgen_saliva_C$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_C$Genus = factor(as.character(sigtabgen_saliva_C$Genus), levels=names(x))
+
+# Plot
+bp_saliva_C_plot <- ggplot(sigtabgen_saliva_C, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = -90,
+                                   hjust = 0,
+                                   vjust=0.5,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Product C: Saliva Microbiome Differential Abundance by Time") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.2)") + 
+  geom_label_repel(label = sigtabgen_saliva_C$Species2, show.legend = FALSE)
+
+bp_saliva_C_plot
+
+# save plot
+ggsave("./deseq2_output/plots/bp_diff_abund_prod_C_saliva.pdf", bp_saliva_C_plot, width = 22, height = 12)
+```
+
+#### Product D
+```{r}
+# Subset Saliva Phyloseq Dataset samples for "Saliva" Sample Type
+bp_norm_saliva_D <- subset_samples(bp_norm_saliva, Product == "D")
+# remove taxa from data with counts below 5000 reads
+bp_norm_saliva_D <- prune_taxa(taxa_sums(bp_norm_saliva_D) > 50, bp_norm_saliva_D)
+```
+
+#### Select Top 9 Phyla
+```{r}
+phylum.sum_saliva_D = tapply(taxa_sums(bp_norm_saliva_D), tax_table(bp_norm_saliva_D)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_saliva_D = names(sort(phylum.sum_saliva_D, TRUE))[1:8]
+bp_norm_saliva_D = prune_taxa((tax_table(bp_norm_saliva_D)[, "Phylum"] %in% top5phyla_saliva_D), bp_norm_saliva_D)
+```
+
+##### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_saliva_D
+
+# Check Sample_Type Factor
+head(sample_data(bp_norm_saliva_D)$Timepoint, n=2)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Timepoint
+bp_saliva_D_dds <- phyloseq_to_deseq2(bp_norm_saliva_D, ~Timepoint)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_saliva_D_geoMeans = apply(counts(bp_saliva_D_dds), 1, gm_mean)
+bp_saliva_D_dds = estimateSizeFactors(bp_saliva_D_dds, geoMeans=bp_saliva_D_geoMeans)
+bp_saliva_D_dds = DESeq(bp_saliva_D_dds, test = "Wald", fitType="local")
+
+```
+##### Contrast Test Table Results
+
+##### Initial vs Final
+
+```{r}
+bp_results_saliva_D <- results(bp_saliva_D_dds, contrast = c("Timepoint", "Initial", "Final"))
+mcols(bp_results_saliva_D)$description
+bp_results_saliva_D = bp_results_saliva_D[order(bp_results_saliva_D$padj, na.last=NA), ]
+head(bp_results_saliva_D)
+alpha = 0.4
+bp_saliva_D_sigtab = bp_results_saliva_D[(bp_results_saliva_D$padj < alpha), ]
+bp_saliva_D_sigtab = cbind(as(bp_saliva_D_sigtab, "data.frame"), as(tax_table(bp_norm_saliva)[rownames(bp_saliva_D_sigtab), ], "matrix"))
+head(bp_saliva_D_sigtab)
+
+write.csv(bp_saliva_D_sigtab, "./deseq2_output/MARS_bracken_diff_abund_deseq2_saliva_product_D.csv")
+```
+
+##### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for condition **Saliva** vs **Fecal** means that the **Saliva** Sample Type had a multiplicative change in observed read abundance of 2^−1=0.5 compared to the **Fecal** Sample Type. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+##### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_saliva_D = subset(bp_saliva_D_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_saliva_D$log2FoldChange, sigtabgen_saliva_D$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_D$Phylum = factor(as.character(sigtabgen_saliva_D$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_saliva_D$log2FoldChange, sigtabgen_saliva_D$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_saliva_D$Genus = factor(as.character(sigtabgen_saliva_D$Genus), levels=names(x))
+
+# Plot
+bp_saliva_D_plot <- ggplot(sigtabgen_saliva_D, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = -90,
+                                   hjust = 0,
+                                   vjust=0.5,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Product D: Saliva Microbiome Differential Abundance by Time") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.4)") + 
+  geom_label_repel(label = sigtabgen_saliva_D$Species2, show.legend = FALSE)
+
+bp_saliva_D_plot
+
+# save plot
+ggsave("./deseq2_output/plots/bp_diff_abund_prod_D_saliva.pdf", bp_saliva_D_plot, width = 22, height = 12)
+```
+
+### Fecal Subset
+
+#### Product A
+```{r}
+# Subset Saliva Phyloseq Dataset samples for "Saliva" Sample Type
+bp_norm_fecal_A <- subset_samples(bp_norm_fecal, Product == "A")
+# remove taxa from data with counts below 5000 reads
+bp_norm_fecal_A <- prune_taxa(taxa_sums(bp_norm_fecal_A) > 50, bp_norm_fecal_A)
+```
+
+##### Select Top 9 Phyla
+```{r}
+phylum.sum_fecal_A = tapply(taxa_sums(bp_norm_fecal_A), tax_table(bp_norm_fecal_A)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_fecal_A = names(sort(phylum.sum_fecal_A, TRUE))[1:8]
+bp_norm_fecal_A = prune_taxa((tax_table(bp_norm_fecal_A)[, "Phylum"] %in% top5phyla_fecal_A), bp_norm_fecal_A)
+```
+
+##### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_fecal_A
+
+# Check Sample_Type Factor
+head(sample_data(bp_norm_fecal_A)$Timepoint, n=2)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Timepoint
+bp_fecal_A_dds <- phyloseq_to_deseq2(bp_norm_fecal_A, ~Timepoint)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_fecal_A_geoMeans = apply(counts(bp_fecal_A_dds), 1, gm_mean)
+bp_fecal_A_dds = estimateSizeFactors(bp_fecal_A_dds, geoMeans=bp_fecal_A_geoMeans)
+bp_fecal_A_dds = DESeq(bp_fecal_A_dds, test = "Wald", fitType="parametric")
+
+```
+##### Contrast Test Table Results
+
+##### Initial vs Final
+
+```{r}
+bp_results_fecal_A <- results(bp_fecal_A_dds, contrast = c("Timepoint", "Initial", "Final"))
+mcols(bp_results_fecal_A)$description
+bp_results_fecal_A = bp_results_fecal_A[order(bp_results_fecal_A$padj, na.last=NA), ]
+head(bp_results_fecal_A)
+alpha = 0.3
+bp_fecal_A_sigtab = bp_results_fecal_A[(bp_results_fecal_A$padj < alpha), ]
+bp_fecal_A_sigtab = cbind(as(bp_fecal_A_sigtab, "data.frame"), as(tax_table(bp_norm_fecal)[rownames(bp_fecal_A_sigtab), ], "matrix"))
+head(bp_fecal_A_sigtab)
+
+write.csv(bp_fecal_A_sigtab, "./deseq2_output/MARS_bracken_diff_abund_deseq2_fecal_product_A.csv")
+```
+
+##### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for condition **Saliva** vs **Fecal** means that the **Saliva** Sample Type had a multiplicative change in observed read abundance of 2^−1=0.5 compared to the **Fecal** Sample Type. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+##### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_fecal_A = subset(bp_fecal_A_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_fecal_A$log2FoldChange, sigtabgen_fecal_A$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_A$Phylum = factor(as.character(sigtabgen_fecal_A$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_fecal_A$log2FoldChange, sigtabgen_fecal_A$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_A$Genus = factor(as.character(sigtabgen_fecal_A$Genus), levels=names(x))
+
+# Plot
+bp_fecal_A_plot <- ggplot(sigtabgen_fecal_A, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = -90,
+                                   hjust = 0,
+                                   vjust=0.5,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Product A: Fecal Microbiome Differential Abundance by Time") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.3)") + 
+  geom_label_repel(label = sigtabgen_fecal_A$Species2, show.legend = FALSE)
+
+bp_fecal_A_plot
+
+# save plot
+ggsave("./deseq2_output/plots/bp_diff_abund_prod_A_fecal.pdf", bp_fecal_A_plot, width = 22, height = 12)
+```
+
+#### Product B
+```{r}
+# Subset Saliva Phyloseq Dataset samples for "Saliva" Sample Type
+bp_norm_fecal_B <- subset_samples(bp_norm_fecal, Product == "B")
+# remove taxa from data with counts below 5000 reads
+bp_norm_fecal_B <- prune_taxa(taxa_sums(bp_norm_fecal_B) > 50, bp_norm_fecal_B)
+```
+
+#### Select Top 9 Phyla
+```{r}
+phylum.sum_fecal_B = tapply(taxa_sums(bp_norm_fecal_B), tax_table(bp_norm_fecal_B)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_fecal_B = names(sort(phylum.sum_fecal_B, TRUE))[1:8]
+bp_norm_fecal_B = prune_taxa((tax_table(bp_norm_fecal_B)[, "Phylum"] %in% top5phyla_fecal_B), bp_norm_fecal_B)
+```
+
+##### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_fecal_B
+
+# Check Sample_Type Factor
+head(sample_data(bp_norm_fecal_B)$Timepoint, n=2)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Timepoint
+bp_fecal_B_dds <- phyloseq_to_deseq2(bp_norm_fecal_B, ~Timepoint)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_fecal_B_geoMeans = apply(counts(bp_fecal_B_dds), 1, gm_mean)
+bp_fecal_B_dds = estimateSizeFactors(bp_fecal_B_dds, geoMeans=bp_fecal_B_geoMeans)
+bp_fecal_B_dds = DESeq(bp_fecal_B_dds, test = "Wald", fitType="parametric")
+
+```
+##### Contrast Test Table Results
+
+##### Initial vs Final
+
+```{r}
+bp_results_fecal_B <- results(bp_fecal_B_dds, contrast = c("Timepoint", "Initial", "Final"))
+mcols(bp_results_fecal_B)$description
+bp_results_fecal_B = bp_results_fecal_B[order(bp_results_fecal_B$padj, na.last=NA), ]
+head(bp_results_fecal_B)
+alpha = 0.2
+bp_fecal_B_sigtab = bp_results_fecal_B[(bp_results_fecal_B$padj < alpha), ]
+bp_fecal_B_sigtab = cbind(as(bp_fecal_B_sigtab, "data.frame"), as(tax_table(bp_norm_fecal)[rownames(bp_fecal_B_sigtab), ], "matrix"))
+head(bp_fecal_B_sigtab)
+
+write.csv(bp_fecal_B_sigtab, "./deseq2_output/MARS_bracken_diff_abund_deseq2_fecal_product_B.csv")
+```
+
+##### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for condition **Saliva** vs **Fecal** means that the **Saliva** Sample Type had a multiplicative change in observed read abundance of 2^−1=0.5 compared to the **Fecal** Sample Type. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+##### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_fecal_B = subset(bp_fecal_B_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_fecal_B$log2FoldChange, sigtabgen_fecal_B$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_B$Phylum = factor(as.character(sigtabgen_fecal_B$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_fecal_B$log2FoldChange, sigtabgen_fecal_B$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_B$Genus = factor(as.character(sigtabgen_fecal_B$Genus), levels=names(x))
+
+# Plot
+bp_fecal_B_plot <- ggplot(sigtabgen_fecal_B, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = -90,
+                                   hjust = 0,
+                                   vjust=0.5,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Product B: Fecal Microbiome Differential Abundance by Time") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.2)") + 
+  geom_label_repel(label = sigtabgen_fecal_B$Species2, show.legend = FALSE)
+
+bp_fecal_B_plot
+
+# save plot
+ggsave("./deseq2_output/plots/bp_diff_abund_prod_B_fecal.pdf", bp_fecal_B_plot, width = 22, height = 12)
+```
+
+#### Product C
+```{r}
+# Subset Saliva Phyloseq Dataset samples for "Fecal" Sample Type
+bp_norm_fecal_C <- subset_samples(bp_norm_fecal, Product == "C")
+# remove taxa from data with counts below 5000 reads
+bp_norm_fecal_C <- prune_taxa(taxa_sums(bp_norm_fecal_C) > 50, bp_norm_fecal_C)
+```
+
+#### Select Top 9 Phyla
+```{r}
+phylum.sum_fecal_C = tapply(taxa_sums(bp_norm_fecal_C), tax_table(bp_norm_fecal_C)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_fecal_C = names(sort(phylum.sum_fecal_C, TRUE))[1:8]
+bp_norm_fecal_C = prune_taxa((tax_table(bp_norm_fecal_C)[, "Phylum"] %in% top5phyla_fecal_C), bp_norm_fecal_C)
+```
+
+##### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_fecal_C
+
+# Check Sample_Type Factor
+head(sample_data(bp_norm_fecal_C)$Timepoint, n=2)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Timepoint
+bp_fecal_C_dds <- phyloseq_to_deseq2(bp_norm_fecal_C, ~Timepoint)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_fecal_C_geoMeans = apply(counts(bp_fecal_C_dds), 1, gm_mean)
+bp_fecal_C_dds = estimateSizeFactors(bp_fecal_C_dds, geoMeans=bp_fecal_C_geoMeans)
+bp_fecal_C_dds = DESeq(bp_fecal_C_dds, test = "Wald", fitType="parametric")
+
+```
+##### Contrast Test Table Results
+
+##### Initial vs Final
+
+```{r}
+bp_results_fecal_C <- results(bp_fecal_C_dds, contrast = c("Timepoint", "Initial", "Final"))
+mcols(bp_results_fecal_C)$description
+bp_results_fecal_C = bp_results_fecal_C[order(bp_results_fecal_C$padj, na.last=NA), ]
+head(bp_results_fecal_C)
+alpha = 0.4
+bp_fecal_C_sigtab = bp_results_fecal_C[(bp_results_fecal_C$padj < alpha), ]
+bp_fecal_C_sigtab = cbind(as(bp_fecal_C_sigtab, "data.frame"), as(tax_table(bp_norm_fecal)[rownames(bp_fecal_C_sigtab), ], "matrix"))
+head(bp_fecal_C_sigtab)
+
+write.csv(bp_fecal_C_sigtab, "./deseq2_output/MARS_bracken_diff_abund_deseq2_fecal_product_C.csv")
+```
+
+##### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for condition **Saliva** vs **Fecal** means that the **Saliva** Sample Type had a multiplicative change in observed read abundance of 2^−1=0.5 compared to the **Fecal** Sample Type. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+##### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_fecal_C = subset(bp_fecal_C_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_fecal_C$log2FoldChange, sigtabgen_fecal_C$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_C$Phylum = factor(as.character(sigtabgen_fecal_C$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_fecal_C$log2FoldChange, sigtabgen_fecal_C$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_C$Genus = factor(as.character(sigtabgen_fecal_C$Genus), levels=names(x))
+
+# Plot
+bp_fecal_C_plot <- ggplot(sigtabgen_fecal_C, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = -90,
+                                   hjust = 0,
+                                   vjust=0.5,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Product C: Fecal Microbiome Differential Abundance by Time") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.4)") + 
+  geom_label_repel(label = sigtabgen_fecal_C$Species2, show.legend = FALSE)
+
+bp_fecal_C_plot
+
+# save plot
+ggsave("./deseq2_output/plots/bp_diff_abund_prod_C_fecal.pdf", bp_fecal_C_plot, width = 22, height = 12)
+```
+
+#### Product D
+```{r}
+# Subset Saliva Phyloseq Dataset samples for "Fecal" Sample Type
+bp_norm_fecal_D <- subset_samples(bp_norm_fecal, Product == "D")
+# remove taxa from data with counts below 5000 reads
+bp_norm_fecal_D <- prune_taxa(taxa_sums(bp_norm_fecal_D) > 50, bp_norm_fecal_D)
+```
+
+#### Select Top 9 Phyla
+```{r}
+phylum.sum_fecal_D = tapply(taxa_sums(bp_norm_fecal_D), tax_table(bp_norm_fecal_D)[, "Phylum"], sum, na.rm=TRUE)
+top5phyla_fecal_D = names(sort(phylum.sum_fecal_D, TRUE))[1:8]
+bp_norm_fecal_D = prune_taxa((tax_table(bp_norm_fecal_D)[, "Phylum"] %in% top5phyla_fecal_D), bp_norm_fecal_D)
+```
+
+##### Convert Phyloseq to DESeq2 
+```{r Phyloseq to DESeq2}
+# Summarize bracken_physeq
+bp_norm_fecal_D
+
+# Check Sample_Type Factor
+head(sample_data(bp_norm_fecal_D)$Timepoint, n=2)
+
+# Convert Phyloseq Object to DESeq2 Class Object by Factor Timepoint
+bp_fecal_D_dds <- phyloseq_to_deseq2(bp_norm_fecal_D, ~Timepoint)
+
+# calculate geometric means prior to estimate size factors
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+bp_fecal_D_geoMeans = apply(counts(bp_fecal_D_dds), 1, gm_mean)
+bp_fecal_D_dds = estimateSizeFactors(bp_fecal_D_dds, geoMeans=bp_fecal_D_geoMeans)
+bp_fecal_D_dds = DESeq(bp_fecal_D_dds, test = "Wald", fitType="parametric")
+
+```
+##### Contrast Test Table Results
+
+##### Initial vs Final
+
+```{r}
+bp_results_fecal_D <- results(bp_fecal_D_dds, contrast = c("Timepoint", "Initial", "Final"))
+mcols(bp_results_fecal_D)$description
+bp_results_fecal_D = bp_results_fecal_D[order(bp_results_fecal_D$padj, na.last=NA), ]
+head(bp_results_fecal_D)
+alpha = 0.5
+bp_fecal_D_sigtab = bp_results_fecal_D[(bp_results_fecal_D$padj < alpha), ]
+bp_fecal_D_sigtab = cbind(as(bp_fecal_D_sigtab, "data.frame"), as(tax_table(bp_norm_fecal)[rownames(bp_fecal_D_sigtab), ], "matrix"))
+head(bp_fecal_D_sigtab)
+
+write.csv(bp_fecal_D_sigtab, "./deseq2_output/MARS_bracken_diff_abund_deseq2_fecal_product_D.csv")
+```
+
+##### Interpretation
+
+> For a particular taxa, a log2 fold change of -1 for condition **Inital** vs **Final** means that the **Initial** Sample Type had a multiplicative change in observed read abundance of 2^−1=0.5 compared to the **Final** Sample Type. Because the variable of interest represents estimated absolute abundance within the sample, the reported log2 fold change for a given taxa represents log2 units of change in absolute abundance (fraction of total reads).
+
+##### Plot
+```{r}
+library("ggplot2")
+theme_set(theme_gray())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+
+# remove records with NA at Genus
+sigtabgen_fecal_D = subset(bp_fecal_D_sigtab, !is.na(Genus))
+
+# Phylum order
+x = tapply(sigtabgen_fecal_D$log2FoldChange, sigtabgen_fecal_D$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_D$Phylum = factor(as.character(sigtabgen_fecal_D$Phylum), levels=names(x))
+
+# Genus order
+x = tapply(sigtabgen_fecal_D$log2FoldChange, sigtabgen_fecal_D$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen_fecal_D$Genus = factor(as.character(sigtabgen_fecal_D$Genus), levels=names(x))
+
+# Plot
+bp_fecal_D_plot <- ggplot(sigtabgen_fecal_D, aes(x=Genus, y=log2FoldChange, color=Phylum)) + 
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = -90,
+                                   hjust = 0,
+                                   vjust=0.5,
+                                   size = 10,
+                                   face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold")) +
+  labs(title = "Product D: Fecal Microbiome Differential Abundance by Time") +
+  labs(y = "log2 Fold Change (Wald Test, Parametric Fit, alpha = 0.5)") + 
+  geom_label_repel(label = sigtabgen_fecal_D$Species2, show.legend = FALSE)
+
+bp_fecal_D_plot
+
+# save plot
+ggsave("./deseq2_output/plots/bp_diff_abund_prod_D_fecal.pdf", bp_fecal_D_plot, width = 22, height = 12)
+```

@@ -1,0 +1,3 @@
+"0","phylum.sum_fecal_D = tapply(taxa_sums(bp_norm_fecal_D), tax_table(bp_norm_fecal_D)[, ""Phylum""], sum, na.rm=TRUE)"
+"0","top5phyla_fecal_D = names(sort(phylum.sum_fecal_D, TRUE))[1:8]"
+"0","bp_norm_fecal_D = prune_taxa((tax_table(bp_norm_fecal_D)[, ""Phylum""] %in% top5phyla_fecal_D), bp_norm_fecal_D)"

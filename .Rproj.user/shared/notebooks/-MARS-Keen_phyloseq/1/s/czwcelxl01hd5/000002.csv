@@ -1,0 +1,8 @@
+"0","# subset to keep only bacteria"
+"0","bp_norm_bac <- subset_taxa(bp_norm, Kingdom ==""Bacteria"")"
+"0","# number of taxa surviving"
+"0","ntaxa(bp_norm_bac)"
+"1","[1]"
+"1"," 4285"
+"1","
+"

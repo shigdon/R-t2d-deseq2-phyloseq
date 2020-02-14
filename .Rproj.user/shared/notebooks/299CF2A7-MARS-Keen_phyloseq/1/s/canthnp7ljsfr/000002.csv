@@ -1,0 +1,8 @@
+"0","# subset to keep only bacteria"
+"0","bp_norm_arc <- subset_taxa(bp_norm, Kingdom ==""Archaea"")"
+"0","# number of taxa surviving"
+"0","ntaxa(bp_norm_arc)"
+"1","[1]"
+"1"," 224"
+"1","
+"

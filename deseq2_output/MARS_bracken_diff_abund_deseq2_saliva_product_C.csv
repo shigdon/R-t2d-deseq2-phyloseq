@@ -1,0 +1,3 @@
+"","baseMean","log2FoldChange","lfcSE","stat","pvalue","padj","Kingdom","Phylum","Class","Order","Family","Genus","Species","OTU","Species2"
+"2184519",26.273055289722,3.65529303276589,0.927715986160484,3.94009921925994,8.14479157627647e-05,0.0163303071104343,"Bacteria","Proteobacteria","Betaproteobacteria","Burkholderiales","Comamonadaceae","Hydrogenophaga","sp. NH-16","2184519","Hydrogenophaga sp. NH-16 2184519"
+"34062",103.166387551342,3.40754518010566,0.859926202475696,3.96260187245774,7.41373558040568e-05,0.0163303071104343,"Bacteria","Proteobacteria","Gammaproteobacteria","Pseudomonadales","Moraxellaceae","Moraxella","osloensis","34062","Moraxella osloensis 34062"

@@ -1,0 +1,24 @@
+{
+    "collab_server" : "",
+    "contents" : "",
+    "created" : 1581714178720.000,
+    "dirty" : false,
+    "encoding" : "UTF-8",
+    "folds" : "",
+    "hash" : "1279071975",
+    "id" : "1CAAF7E8",
+    "lastKnownWriteTime" : 1581715197,
+    "last_content_update" : 1581715198258,
+    "path" : "~/Box/SMH_PhD/DEB_Internship/Projects/MARS/MARS_phyloseq/MARS-Keen_phyloseq.Rmd",
+    "project_path" : "MARS-Keen_phyloseq.Rmd",
+    "properties" : {
+        "cursorPosition" : "15,16",
+        "docOutlineVisible" : "1",
+        "last_setup_crc32" : "67AD2378bb338d19",
+        "scrollLine" : "3"
+    },
+    "relative_order" : 1,
+    "source_on_save" : false,
+    "source_window" : "",
+    "type" : "r_markdown"
+}

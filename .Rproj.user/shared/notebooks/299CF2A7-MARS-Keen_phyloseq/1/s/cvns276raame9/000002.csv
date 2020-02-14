@@ -1,0 +1,4 @@
+"0","# Subset Saliva Phyloseq Dataset samples for ""Saliva"" Sample Type"
+"0","bp_norm_fecal_A <- subset_samples(bp_norm_fecal, Product == ""A"")"
+"0","# remove taxa from data with counts below 5000 reads"
+"0","bp_norm_fecal_A <- prune_taxa(taxa_sums(bp_norm_fecal_A) > 50, bp_norm_fecal_A)"

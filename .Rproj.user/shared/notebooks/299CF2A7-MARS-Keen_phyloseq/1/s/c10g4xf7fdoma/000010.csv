@@ -1,0 +1,2 @@
+"0","# save plot"
+"0","ggsave(""./beta_plots/fecal_beta_pca_bray_norm.pdf"", beta_norm_bray_pca_fecal, width = 22, height = 12)   "

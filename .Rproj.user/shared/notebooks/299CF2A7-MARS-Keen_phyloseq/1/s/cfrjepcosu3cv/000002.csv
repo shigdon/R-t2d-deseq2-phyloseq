@@ -1,0 +1,6 @@
+"0","library(tidyverse)
+"
+"2","package ‘tibble’ was built under R version 3.5.2"
+"2","package ‘purrr’ was built under R version 3.5.2"
+"2","package ‘stringr’ was built under R version 3.5.2"
+"2","package ‘forcats’ was built under R version 3.5.2"

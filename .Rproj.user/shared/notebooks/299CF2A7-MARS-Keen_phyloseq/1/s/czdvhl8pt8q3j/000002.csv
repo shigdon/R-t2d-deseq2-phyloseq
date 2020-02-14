@@ -1,0 +1,4 @@
+"0","# Subset Phyloseq Dataset samples for ""Product D"""
+"0","bp_norm_D <- subset_samples(bp_norm, Product == ""D"")"
+"0","# remove taxa from data with counts below 5000 reads"
+"0","bp_norm_D <- prune_taxa(taxa_sums(bp_norm_D) > 5000, bp_norm_D)"

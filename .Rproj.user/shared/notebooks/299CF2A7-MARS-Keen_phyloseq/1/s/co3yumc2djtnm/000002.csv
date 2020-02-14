@@ -1,0 +1,1 @@
+"0","bp_alpha_pruned <- prune_taxa(taxa_sums(bracken_physeq) > 0, bracken_physeq)"
